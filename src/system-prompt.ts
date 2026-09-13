@@ -85,8 +85,10 @@ export function sanitizePromptSections(raw: unknown): Partial<PiPromptSections> 
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
     if (PROMPT_SECTION_KEYS.has(k) && (typeof v === "string" || v === null)) {
       (out as Record<string, SectionOverride>)[k] = v;
-    } else if (RULE_SLOT_KEYS.has(k) && v === null) {
-      (out as Record<string, SectionOverride>)[k] = null;
+    } else if (RULE_SLOT_KEYS.has(k) && (typeof v === "string" || v === null)) {
+      // Rule slots accept replacement text too (kernel #263/#266: lean ships a
+      // condensed HOW-TO-COMPRESS string, not just null-to-remove).
+      (out as Record<string, SectionOverride>)[k] = v;
     }
   }
   return out;

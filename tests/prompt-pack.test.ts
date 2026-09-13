@@ -6,8 +6,9 @@ import * as path from "node:path";
 import { defaultPrompts } from "acp-kernel";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createAcpExtension } from "../src/index.js";
-import { buildAcpSystemPrompt } from "../src/system-prompt.js";
+import { buildAcpSystemPrompt, sanitizePromptSections } from "../src/system-prompt.js";
 import { leanPack } from "../src/prompt-pack.js";
+import type { Pack } from "../src/prompt-pack.js";
 import {
   isValidPackName,
   discoverPack,
@@ -49,6 +50,32 @@ test("lean pack is a kernel builtin carrying its pi surface under adapters", () 
   assert.ok(String(rules).includes("Recall on demand only"));
   assert.ok(String(rules).includes("settled history"));
   assert.ok(String(rules).includes("makes recall unnecessary"));
+});
+
+test("rule-slot STRING overrides survive sanitize and replace the slot text in the rendered prompt (#423)", () => {
+  const sections = sanitizePromptSections({
+    philosophy: "CUSTOM-PHILOSOPHY",
+    howToCompress: "CONDENSED-HOW-TO",
+    tier2: null,
+    bogus: "dropped",
+  });
+  assert.equal(sections.philosophy, "CUSTOM-PHILOSOPHY");
+  assert.equal(sections.howToCompress, "CONDENSED-HOW-TO");
+  assert.equal(sections.tier2, null);
+  assert.equal((sections as Record<string, unknown>).bogus, undefined);
+  const prompt = buildAcpSystemPrompt(defaultPrompts, sections);
+  assert.ok(prompt.includes("CONDENSED-HOW-TO"), "string override replaces the slot body");
+  assert.ok(!prompt.includes(defaultPrompts.howToCompressRules.slice(0, 60)), "default slot text is gone");
+});
+
+test("piAdapterSurface keeps a kernel-master-style condensed howToCompress string (#423)", () => {
+  const pack: Pack = {
+    name: "lean-next",
+    source: "test",
+    surface: { adapters: { pi: { promptSections: { howToCompress: "HOW TO COMPRESS (condensed)\n\nYour summary becomes the only record" } } } },
+  };
+  const s = piAdapterSurface(pack);
+  assert.equal(s.promptSections.howToCompress, "HOW TO COMPRESS (condensed)\n\nYour summary becomes the only record");
 });
 
 test("piAdapterSurface(leanPack): aligned rules kept, every other section nulled, lean tool extras", () => {
@@ -187,7 +214,9 @@ test("piAdapterSurface sanitizes junk: bad section types dropped, malformed extr
     },
   };
   const s = piAdapterSurface(pack);
-  assert.deepEqual(s.promptSections, { tools: null, whenToCompress: "keep" });
+  // philosophy: "no" is now KEPT — rule slots accept replacement strings (#423),
+  // matching the kernel #263/#266 lean contract (condensed HOW-TO-COMPRESS).
+  assert.deepEqual(s.promptSections, { tools: null, whenToCompress: "keep", philosophy: "no" });
   assert.deepEqual(s.toolExtras, {
     compress: { promptGuidelines: ["single"] },
     acp_status: { promptSnippet: "s" },
