@@ -236,13 +236,13 @@ export interface AdapterConfig {
    *  unbounded behavior). */
   toolBashDefaultTimeout?: number;
   /** Hard byte cap applied to tool result text via the `tool_result` hook.
-   *  Default: 200000 (~200KB, roughly 5000 lines at ~40 bytes/line) — a
-   *  generous ceiling that stops runaway output. Pi already caps bash/read/grep
-   *  at 50KB/2000 lines (bash full output is saved to a temp file), so this
-   *  default mainly caps tools Pi doesn't cap. Set lower (e.g. 8192) for a
-   *  tighter context budget, or 0 to disable. When capped, oversized text is
-   *  head-truncated with a notice telling the model how to see the full output
-   *  (bash: read BashToolDetails.fullOutputPath). */
+   *  Default: 50000 (~50KB) — aligned with Pi's own bash/read/grep caps
+   *  (50KB/2000 lines), so every tool path lands under the same ceiling.
+   *  This default mainly caps tools Pi doesn't cap itself (MCP/custom tools
+   *  with unbounded output). Set lower (e.g. 8192) for a tighter context
+   *  budget, or 0 to disable. When capped, oversized text is head-truncated
+   *  with a notice telling the model how to see the full output (bash: read
+   *  BashToolDetails.fullOutputPath). */
   toolOutputMaxBytes?: number;
   /** Delegate sub-agent config. Accepts a boolean shorthand (`true` →
    *  `{ enabled: true }`, `false` → `{ enabled: false }`) or a DelegateConfig
@@ -314,7 +314,7 @@ export interface AdapterConfig {
 }
 
 export const DEFAULT_TOOL_BASH_TIMEOUT = 60;
-export const DEFAULT_TOOL_OUTPUT_MAX_BYTES = 200_000;
+export const DEFAULT_TOOL_OUTPUT_MAX_BYTES = 50_000;
 
 /** Resolve delegate config from the adapter, handling the boolean shorthand
  *  and the legacy flat `displayUsage` alias. Precedence: env > acp.json >

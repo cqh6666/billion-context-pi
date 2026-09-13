@@ -34,7 +34,7 @@
   "modelContextLimit": 200000,
   "outputHeadroomMaxPct": 0.25,
   "toolBashDefaultTimeout": 60,
-  "toolOutputMaxBytes": 200000,
+  "toolOutputMaxBytes": 50000,
 
   "throttleRetry": {
     "enabled": true,
@@ -100,7 +100,7 @@
 | `modelContextLimit` | number | *(自动)* | 🟢 ACTIVE | 覆盖上下文窗口大小（token 数）。 |
 | `outputHeadroomMaxPct` | number \| string | `0.25` | 🟢 ACTIVE | 输出预留（output headroom）占上下文窗口的比例上限。 |
 | `toolBashDefaultTimeout` | number | `60` | 🟢 ACTIVE | 模型省略 `timeout` 时注入 bash 工具的默认超时秒数。 |
-| `toolOutputMaxBytes` | number | `200000` | 🟢 ACTIVE | 工具返回文本的硬性字节上限。 |
+| `toolOutputMaxBytes` | number | `50000` | 🟢 ACTIVE | 工具返回文本的硬性字节上限。 |
 | `throttleRetry` | boolean \| object | `true` | 🟢 ACTIVE | 自动重试 provider 侧 token 限流错误（递进退避）。 |
 | `repetitionGuard` | boolean \| object | `true` | 🟢 ACTIVE | 打断字节级完全相同的工具调用死循环（连续 3 次告警，连续 5 次拦截并中止本轮）。 |
 | `degenerationGuard` | boolean \| object | `true` | 🟢 ACTIVE | 折叠出站视图中 assistant text/thinking 里的单字符退化连击（如 4655×「【」）并注入一次性恢复通知——打破 pi 每轮请求都回传退化 thinking 导致的连环 abort 死循环（#351）。 |
@@ -221,9 +221,9 @@
 ### `toolOutputMaxBytes`
 
 - **类型：** `number`
-- **默认值：** `200000`
+- **默认值：** `50000`
 - **状态：** 🟢 ACTIVE
-- **说明：** 通过 `tool_result` 钩子对工具返回文本施加的硬性字节上限（约 200KB，约 5000 行）。它拦截 Pi 自身上限无法覆盖的失控输出（例如 Pi 不做限制的工具）。触发上限时，超长文本会被头部截断，并附带提示告知模型如何查看完整输出。设小一些（如 `8192`）可收紧上下文预算，设为 `0` 则完全禁用。
+- **说明：** 通过 `tool_result` 钩子对工具返回文本施加的硬性字节上限（约 50KB），与 Pi 自身的 bash/read/grep 上限（50KB / 2000 行）对齐，让所有工具路径落在同一天花板下。它拦截 Pi 自身不做限制的工具（MCP / 自定义工具）的失控输出。触发上限时，超长文本会被头部截断，并附带提示告知模型如何查看完整输出（bash：读 `BashToolDetails.fullOutputPath`）。设小一些（如 `8192`）可收紧上下文预算，设为 `0` 则完全禁用。
 
 ---
 
