@@ -105,6 +105,7 @@ All keys below are currently **ACTIVE**.
 | `throttleRetry` | boolean \| object | `true` | 🟢 ACTIVE | Auto-retry provider token rate-limit errors with progressive backoff. |
 | `repetitionGuard` | boolean \| object | `true` | 🟢 ACTIVE | Break infinite loops of byte-identical tool calls (warn at 3 consecutive, block + abort at 5). |
 | `degenerationGuard` | boolean \| object | `true` | 🟢 ACTIVE | Collapse degenerate single-codepoint runs (e.g. 4655×「【」) in assistant text/thinking of the outgoing view and inject a one-shot recovery notice — breaks the abort loop where pi replays degenerated thinking back to the provider on every request (#351). |
+| `rules` | boolean | `false` | 🟢 ACTIVE | Enable the `acp_rule` tool — persistent, short, principle-level reminders that are never compressed away. **Off by default.** |
 
 **Delegate keys**
 
@@ -315,6 +316,40 @@ The `delegate` sub-object controls the `acp_delegate` sub-agent tool family (`ac
 }
 ```
 
+
+---
+
+## Rules
+
+The `rules` feature adds a single ordinary tool, `acp_rule`, for recording **persistent reminders** that must survive context compression. It is orthogonal to every other ACP tool — it leaves a trace; it does not compress, search, or otherwise touch the conversation, and it does not modify the system prompt.
+
+**Usage.** The tool takes one optional argument, `rule`:
+- pass text → records it and echoes `Recorded <id>: <text>`;
+- omit it (or pass blank) → lists all recorded rules, for humans to read.
+
+There is deliberately no remove/clear action — stale entries stay until the session ends or the state file is edited.
+
+**What to record.** The tool description instructs the model to use `acp_rule` when:
+- the user **emphasizes or repeatedly stresses** a lesson, rule, or preference;
+- the user asks the model to **remember a specific behavior**;
+- the model itself hits a **major pitfall** worth not repeating.
+
+Entries are expected to be **short and principle-based** — one line each, not paragraphs. The kernel rejects entries longer than 300 characters and caps each session at 50 rules, both with plain-text guidance instead of errors.
+
+**Why rules survive compression.** `acp_rule` is in the kernel's always-protected set (alongside `compress`), so its tool calls and results are excluded from compression ranges by default — the recorded trace never gets pruned out of the transcript. Rules also persist in the session's `.acp.json` sidecar alongside compression state, so they survive restarts of the same session.
+
+### `rules`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** 🟢 ACTIVE
+- **Description:** Enable the `acp_rule` tool. Off by default so existing sessions see no behavior change.
+
+```json
+{
+  "rules": true
+}
+```
 
 ---
 

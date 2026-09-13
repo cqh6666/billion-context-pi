@@ -251,6 +251,14 @@ export interface AdapterConfig {
    *  boolean shorthand (`false` disables) or an object. Default: enabled,
    *  minRun=200. */
   degenerationGuard?: boolean | DegenerationGuardConfig;
+   /** Persistent rule-recording (the `acp_rule` tool, issue #433). Lets the
+    *  model record short, principle-level reminders that must survive context
+    *  compression: lessons the user emphasized, behaviors the user asked to be
+    *  remembered, or major pitfalls the model hit. Recording leaves only a tool
+    *  call + one-line result, both hard-protected from compression by the kernel
+    *  — no system-prompt changes. No argument lists recorded rules. Default:
+    *  disabled — set `rules: true` in acp.json to opt in. */
+   rules?: boolean;
   /** Legacy flat alias for `delegate.displayUsage`. Kept for backward
    *  compatibility with existing acp.json files. Prefer `delegate.displayUsage`. */
   displayUsage?: "merged" | "separate";

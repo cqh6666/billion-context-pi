@@ -33,6 +33,7 @@ Unlike Pi's built-in auto-compaction (which replaces everything with a single su
 - **Multi-tier** — summaries can be further distilled (T1 → T2 → T3) as sessions grow
 - **Searchable** — `search_context` finds information inside compressed blocks without decompressing
 - **Selective** — protected tools, user messages, and the recent working set are never compressed
+- **Persistent rules** — `acp_rule` records short, principle-level reminders (user-emphasized lessons, behaviors to keep, big pitfalls hit) as a hard-protected trace that survives compression; omitting the argument lists them for humans (opt-in via `"rules": true`)
 
 This means:
 
@@ -113,6 +114,7 @@ billion-context-pi is built for the **Pi** coding agent (`@earendil-works/pi-cod
 | `decompress` | Restore a previously compressed block's content |
 | `search_context` | Search compressed block summaries (and visible messages) by keyword |
 | `acp_status` | Show context usage, compressed blocks, compressible ranges |
+| `acp_rule` | Record short persistent reminders that survive compression; no argument lists them (opt-in) |
 | `acp_delegate` | Spawn a clean-context sub-agent for a task (review / research / implement / plan / advise) |
 | `acp_delegate_wait` | Block until a delegate run finishes (returns its result; times out otherwise) |
 | `acp_delegate_cancel` | Cancel a running delegate by runId |
@@ -207,7 +209,7 @@ The model receives detailed guidance (in its system prompt) on **when** to compr
 
 billion-context protects three categories of content from compression:
 
-1. **Always-protected tools** — `compress` calls are hard-protected (they're load-bearing metadata; compressing them breaks decompress and the "summary is historical" contract).
+1. **Always-protected tools** — `compress` calls are hard-protected (they're load-bearing metadata; compressing them breaks decompress and the "summary is historical" contract). When the opt-in `acp_rule` feature is on, its calls and results are hard-protected too, so the recorded rule trace never gets pruned out of the transcript.
 2. **Soft recent-zone** — the last N messages (default 5) and last ~5K tokens are soft-protected so the model keeps its working set. Tool results from `decompress`, `search_context`, `read`, and `bash` are **excluded** from this zone: they're large and meant to be compressible once consumed, so they don't eat the protected budget.
 3. **Last user message** — always protected (user intent must survive).
 

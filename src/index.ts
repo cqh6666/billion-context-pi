@@ -16,6 +16,7 @@ import { makeCompressTool, isCompressSuccessText, isCompressNoopText } from "./c
 import { makeDecompressTool } from "./decompress-tool.js";
 import { makeSearchTool } from "./search-tool.js";
 import { makeStatusTool } from "./status-tool.js";
+import { makeRuleTool } from "./rule-tool.js";
 import { makeDelegateTool, makeDelegateWaitTool, makeDelegateCancelTool, runningRunsSnapshot, resetDelegateUsage, setDelegateDisplayUsage, setDelegatePolicy, setDelegateDefaults, setDelegateNotifyIfRead, markDelegateResultRead, markDelegateRunReadByCommand } from "./delegate-tool.js";
 import { makeCommands } from "./commands.js";
 import { coreOutToAgentMessages, extractText } from "./messages.js";
@@ -218,6 +219,11 @@ function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
           handler: (ctx) => { void openFleetInspector(ctx); },
         });
       }
+    }
+    // acp_rule (issue #433): registered like delegate — its enable flag can
+    // come from acp.json, which reloadConfig above just loaded. Off by default.
+    if (runtime.adapter.rules) {
+      pi.registerTool(makeRuleTool(runtime));
     }
     // Headless hosts exit as soon as the turn ends; awaiting the check keeps
     // the process alive until a running install finishes. TUI stays
