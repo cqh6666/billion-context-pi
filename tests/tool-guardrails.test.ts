@@ -163,14 +163,14 @@ function textOf(part: unknown): string {
   throw new Error("expected a text content part");
 }
 
-test("wireToolGuardrails applies the documented 200KB default when toolOutputMaxBytes is unset", () => {
+test("wireToolGuardrails applies the documented 50KB default when toolOutputMaxBytes is unset", () => {
   const onResult = wireFor({});
   const ret = onResult(readResult("x".repeat(300 * 1024)));
   assert.ok(ret && typeof ret === "object" && "content" in ret && Array.isArray(ret.content),
     "oversized output must be capped even with no explicit config");
   const t = textOf(ret.content[0]);
   assert.match(t, /\[ACP guardrail/);
-  assert.ok(Buffer.byteLength(t, "utf8") < 250 * 1024, "payload must be truncated near the 200KB default");
+  assert.ok(Buffer.byteLength(t, "utf8") < 60 * 1024, "payload must be truncated near the 50KB default");
 });
 
 test("wireToolGuardrails keeps an explicit toolOutputMaxBytes: 0 as disable", () => {

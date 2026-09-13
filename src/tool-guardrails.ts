@@ -243,7 +243,7 @@ export function wireToolGuardrails(pi: ExtensionAPI, runtime: AcpRuntime): void 
       isBash && event.isError ? detectBashTimeout(event.content) : undefined;
 
     let modified: ToolResultEvent["content"] | undefined;
-    // Unset must mean the documented 200KB default (CONFIGURATION.md), not
+    // Unset must mean the documented 50KB default (CONFIGURATION.md), not
     // "no cap"; only an explicit 0/negative disables. capToolOutput applies
     // the same fallback internally, but resolving it here keeps logs accurate.
     const max = runtime.adapter.toolOutputMaxBytes ?? DEFAULT_TOOL_OUTPUT_MAX_BYTES;
