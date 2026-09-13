@@ -11,10 +11,10 @@ export interface PiPromptSections {
   decompressPhilosophy?: SectionOverride;
   contextBreakdown?: SectionOverride;
   throttleRetry?: SectionOverride;
-  philosophy?: null;
-  howToCompress?: null;
-  tier2?: null;
-  tier3?: null;
+  philosophy?: SectionOverride;
+  howToCompress?: SectionOverride;
+  tier2?: SectionOverride;
+  tier3?: SectionOverride;
 }
 
 const SECTIONS: ReadonlyArray<readonly [string, string]> = [
