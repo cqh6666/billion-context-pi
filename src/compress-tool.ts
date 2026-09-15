@@ -5,12 +5,18 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { AcpRuntime } from "./runtime.js";
+import { MAX_COMPRESS_ATTEMPTS } from "./runtime.js";
 import { debug, logError, logInfo, logThrow, logWarn } from "./log.js";
-import { estimateTokens, collectCoveredMessageIds, calibrateTokens, collectImageTokens, modelSupportsImages } from "./tokens.js";
-import { defaultCountTokens, parseCompressArgs, type CompressionBlock, type CompressParseDiagnostics } from "acp-kernel";
+import { estimateTokens, collectCoveredMessageIds, collectImageTokens, modelSupportsImages, adjustedTokenCount } from "./tokens.js";
+import { applyToolPromptOverrides, type ToolPromptOverrides } from "./surface.js";
+import { lastTurnBoundaryId } from "./turn-boundary.js";
+import { resolveHostSession } from "./config.js";
+import { defaultCountTokens, parseCompressArgs, viableRanges, formatRanges, type CompressionBlock, type CompressionState, type CompressParseDiagnostics, type NudgeDecision } from "acp-kernel";
+import { countUnicodeEscapes, findUnverifiableUserQuote, sanitizeSummary } from "./summary-sanitize.js";
 import { getSystemPromptText } from "./compat.js";
 import { resolveRollover } from "./config.js";
 import { emptyPending, pendingOverlaps, rangeTokenEstimate } from "./rollover.js";
+import { UNSUPPORTED_HOST_MESSAGE } from "./omp.js";
 
 function formatK(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n);
@@ -40,8 +46,8 @@ const CompressParams = Type.Object({
 
 type CompressArgs = Static<typeof CompressParams>;
 
-export function makeCompressTool(runtime: AcpRuntime): ToolDefinition<typeof CompressParams> {
-  return {
+export function makeCompressTool(runtime: AcpRuntime, overrides?: ToolPromptOverrides): ToolDefinition<typeof CompressParams> {
+  return applyToolPromptOverrides({
     name: "compress",
     label: "Compress",
     description:
@@ -55,6 +61,7 @@ export function makeCompressTool(runtime: AcpRuntime): ToolDefinition<typeof Com
     ],
     parameters: CompressParams,
     async execute(toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {
+      if (runtime.refused) return { details: undefined, content: [{ type: "text", text: runtime.refusalMessage ?? UNSUPPORTED_HOST_MESSAGE }] };
       let result: string;
       try {
         result = await handleCompress(params as CompressArgs, runtime, ctx, toolCallId);
@@ -64,7 +71,7 @@ export function makeCompressTool(runtime: AcpRuntime): ToolDefinition<typeof Com
       }
       return { details: undefined, content: [{ type: "text", text: result }] };
     },
-  };
+  }, overrides);
 }
 
 type RangeEntry = Static<typeof RangeSpec>;
@@ -76,13 +83,44 @@ type RangeEntry = Static<typeof RangeSpec>;
 // the failure cap (a returned string would land as isError:false and count
 // as neutral). An empty array passes through (the call site returns "No
 // ranges provided.").
-function normalizeRanges(args: CompressArgs): RangeEntry[] | string {
-  const { ranges, diagnostics } = parseCompressArgs(args);
+export function normalizeRanges(args: CompressArgs): RangeEntry[] | string {
+  const effective = repairContentTail(args);
+  const { ranges, diagnostics } = parseCompressArgs(effective);
   if (ranges.length === 0) {
-    if (Array.isArray(args.content) && args.content.length === 0) return [];
-    return describeDiagnostics(diagnostics, args.content);
+    if (Array.isArray(effective.content) && effective.content.length === 0) return [];
+    return describeDiagnostics(diagnostics, effective.content);
   }
   return ranges.map((r) => ({ startId: r.startRef, endId: r.endRef, summary: r.summary, topic: r.topic }));
+}
+
+// Qwen-family models in non-strict tool-call mode sometimes emit the `content`
+// array as a JSON-encoded string whose LAST entry object is missing its closing
+// `}` (tail `"]` instead of `"}]`). The kernel's lenient parser then drops that
+// last range — or every range, when it is the only one — and reports a
+// misleading "truncated"/"no-valid-ranges" diagnostic. Repair the brace before
+// delegating so the whole array parses. Args are returned unchanged when the
+// repair does not apply.
+function repairContentTail(args: CompressArgs): CompressArgs {
+  if (typeof args.content !== "string") return args;
+  const repaired = tailRepair(args.content);
+  return repaired === undefined ? args : { ...args, content: repaired };
+}
+
+// Deterministic tail-repair: if the trimmed string ends with `"]` and the char
+// before it is a closing `"`, retry the parse with `"}]` appended. A valid JSON
+// array never still parses after appending `}`, so this has no false positives.
+export function tailRepair(s: string): string | undefined {
+  const t = s.trimEnd();
+  if (!t.endsWith("]")) return undefined;
+  const body = t.slice(0, -1).trimEnd();
+  if (!body.endsWith('"')) return undefined;
+  const candidate = body + "}]";
+  try {
+    if (Array.isArray(JSON.parse(candidate))) return candidate;
+  } catch {
+    // not the missing-brace case
+  }
+  return undefined;
 }
 
 function describeDiagnostics(diagnostics: CompressParseDiagnostics, content: CompressArgs["content"]): string {
@@ -96,14 +134,42 @@ function describeDiagnostics(diagnostics: CompressParseDiagnostics, content: Com
   if (diagnostics.invalidItems > 0) {
     return `${base}; ${diagnostics.invalidItems} entr${diagnostics.invalidItems === 1 ? "y was" : "ies were"} dropped as invalid. Each range must be an object with string fields startId, endId, summary.`;
   }
+  const parseErr = jsonParseError(content);
+  if (parseErr !== undefined) {
+    return `${base}; the JSON failed to parse: ${parseErr}. Fix the malformed JSON (e.g. a missing closing brace or quote) and retry.`;
+  }
   return `${base}. content must be an ARRAY of {startId, endId, summary} objects.`;
 }
 
-/** Panel block count ("… (~N reclaimed, B blocks)"), or -1 for non-panels. */
-function compressPanelBlocks(text: string): number {
+// Short diagnostic for why a JSON-shaped string fails to parse, or undefined
+// when it parses fine or is not JSON-shaped. Gives the model a retryable signal
+// (the parser's own position) instead of the misleading "must be an ARRAY".
+function jsonParseError(content: CompressArgs["content"]): string | undefined {
+  if (typeof content !== "string") return undefined;
+  const t = content.trim();
+  if (!t.startsWith("{") && !t.startsWith("[")) return undefined;
+  try {
+    JSON.parse(t);
+    return undefined;
+  } catch (e) {
+    return e instanceof Error ? e.message : String(e);
+  }
+}
+
+/** Panel block count, or -1 for non-panels. Accepts BOTH the legacy
+ *  "… B blocks)" form (0-block runs; historical transcripts replayed by
+ *  index/floor-stale) and the #376 "… blocks: b3=m00044–m00097*, …" form. */
+export function compressPanelBlocks(text: string): number {
   if (!text.trimStart().startsWith("▣ ACP |")) return -1;
   const m = text.match(/, (\d+) blocks?\)/);
-  return m ? Number(m[1]) : -1;
+  if (m) return Number(m[1]);
+  // Count span-form entries by their label tokens (bN= / bN(Tn)=), NOT by
+  // capturing to the next ")" — tier labels carry a ")" that would truncate a
+  // naive capture and undercount any batch whose first new block is T2/T3.
+  const idx = text.indexOf(", blocks: ");
+  if (idx === -1) return -1;
+  const header = text.slice(idx).split("\n", 1)[0] ?? "";
+  return header.match(/\bb\d+(?:\(T\d+\))?=/g)?.length ?? 0;
 }
 
 /** Success = completed run that created >= 1 block (partial range errors
@@ -120,6 +186,121 @@ export function isCompressSuccessText(text: string): boolean {
  *  the retry cap applies. Non-panels ("No ranges provided.") stay neutral. */
 export function isCompressNoopText(text: string): boolean {
   return compressPanelBlocks(text) === 0;
+}
+
+// Issue #250 loop breaker: small models repeat an identical compress call with
+// refs that can NEVER resolve (stale/consumed/unknown) — the kernel rejects
+// every time and the model just retries the same dead refs for minutes. A
+// range is "dead" when the kernel's boundary resolver will reject it no matter
+// what summary is written, so repeating the same dead range set is guaranteed
+// to fail. After DEAD_REPEAT_REJECT identical failures we stop running the
+// kernel and return a hard rejection that lists the LIVE compressible ranges
+// (from the nudge decision already computed in this call), so the model gets
+// usable refs without having to call acp_status.
+const DEAD_REPEAT_REJECT = 2;
+
+function paddedRef(n: number): string {
+  return `m${String(n).padStart(5, "0")}`;
+}
+
+// issue #376: report each new block's ACTUAL coverage, not the requested
+// startId/endId — kernel protection exclusions and turn-integrity rollback
+// can shrink a range post-hoc, so inferring coverage from the request drifts
+// the model's block ledger against nudge ranges. Span = first/last ref of
+// effectiveMessageIds; `*` marks spans containing still-existing refs the
+// block does not cover (excluded — see the ⚠️ warnings line); tier ≥ 2 marked.
+export function blockSpanLabel(block: CompressionBlock, state: CompressionState): string {
+  const nums: number[] = [];
+  for (const id of block.effectiveMessageIds) {
+    const ref = state.messageRefs.byRaw[id];
+    if (!ref || !ref.startsWith("m")) continue;
+    const n = Number(ref.slice(1));
+    if (Number.isInteger(n) && n > 0) nums.push(n);
+  }
+  const tierMark = block.tier >= 2 ? `(T${block.tier})` : "";
+  if (nums.length === 0) return `${block.blockId}${tierMark}`;
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const n of nums) {
+    if (n < lo) lo = n;
+    if (n > hi) hi = n;
+  }
+  const present = new Set(nums);
+  let star = "";
+  for (let n = lo; n <= hi; n++) {
+    if (!present.has(n) && state.messageRefs.byRef[paddedRef(n)] !== undefined) {
+      star = "*";
+      break;
+    }
+  }
+  const span = lo === hi ? paddedRef(lo) : `${paddedRef(lo)}–${paddedRef(hi)}`;
+  return `${block.blockId}${tierMark}=${span}${star}`;
+}
+
+function blockHasVisibleAnchor(block: CompressionBlock, visibleIds: Set<string>): boolean {
+  if (visibleIds.has(`acp_summary_${block.blockId}`)) return true;
+  return block.effectiveMessageIds.some((id) => visibleIds.has(id));
+}
+
+function hasActiveOwner(state: CompressionState, ownedIds: string[], visibleIds: Set<string>): boolean {
+  const owned = new Set(ownedIds);
+  for (const block of state.blocks) {
+    if (!block.active) continue;
+    const inheritsOwned = block.directBlockIds.some((childId) => {
+      const child = state.blocks.find((c) => c.blockId === childId);
+      return child !== undefined && child.effectiveMessageIds.some((id) => owned.has(id));
+    });
+    if (inheritsOwned && blockHasVisibleAnchor(block, visibleIds)) return true;
+  }
+  return false;
+}
+
+function refIsDead(ref: string, state: CompressionState, visibleIds: Set<string>): boolean {
+  const trimmed = ref.trim();
+  if (/^b\d+$/i.test(trimmed)) {
+    const block = state.blocks.find((b) => b.blockId.toLowerCase() === trimmed.toLowerCase());
+    if (!block) return true;
+    if (block.active && blockHasVisibleAnchor(block, visibleIds)) return false;
+    return !hasActiveOwner(state, block.effectiveMessageIds, visibleIds);
+  }
+  const m = trimmed.match(/^m(\d+)$/i);
+  if (!m) return true;
+  const rawId = state.messageRefs.byRef[trimmed] ?? state.messageRefs.byRef[paddedRef(Number(m[1]))];
+  if (!rawId) return true;
+  if (visibleIds.has(rawId)) return false;
+  return !hasActiveOwner(state, [rawId], visibleIds);
+}
+
+function compressibleSnapshotText(nudge: NudgeDecision | undefined): string {
+  const ranges = viableRanges(nudge?.compressibleRanges ?? []);
+  if (ranges.length === 0) {
+    return "No compressible ranges remain — the context is already at its minimum; continue the task without compressing.";
+  }
+  return formatRanges(ranges, []);
+}
+
+function deadRepeatRejectionText(spans: string[], count: number, snapshot: string): string {
+  return [
+    "▣ ACP | 0 → 0 tokens (~0 reclaimed, 0 blocks)",
+    `[ACP] REJECTED — this exact compress call has now failed ${count}× (ranges ${spans.join(", ")}). Those refs are stale: they point at content already compressed into an active block, or at refs that no longer exist. Repeating this call cannot succeed — do not retry it.`,
+    "",
+    "Current compressible ranges (use these refs exactly as listed):",
+    snapshot,
+    "",
+    "If none of these fit, call acp_status for the full picture — or continue the task without compressing.",
+  ].join("\n");
+}
+
+function cappedRejectionText(snapshot: string): string {
+  return [
+    "▣ ACP | 0 → 0 tokens (~0 reclaimed, 0 blocks)",
+    `[ACP] PAUSED — ${MAX_COMPRESS_ATTEMPTS} compress attempts already failed this turn; further compress calls are rejected until the next user message.`,
+    "",
+    "Current compressible ranges (use these refs exactly as listed):",
+    snapshot,
+    "",
+    "Continue the task; compress becomes available again on the next user message.",
+  ].join("\n");
 }
 
 function tier3OnlyRewrite(newBlocks: CompressionBlock[], allBlocks: CompressionBlock[]): string[] | null {
@@ -141,6 +322,26 @@ function tier3OnlyRewrite(newBlocks: CompressionBlock[], allBlocks: CompressionB
   return spans;
 }
 
+// #344: the rewrite guard stops the loop but its recovery hint only covers
+// message-type ranges. When the session's actionable mass is tier blocks, name
+// them so repetition-prone models get a concrete next action instead of
+// hunting (and re-hitting the guard).
+function tierReadyHint(state: CompressionState, config: ReturnType<AcpRuntime["configFor"]>): string {
+  if (!config.tiers.enabled) return "";
+  const active = state.blocks.filter((b) => b.active);
+  const first = (bs: CompressionBlock[]) => bs[0]?.blockId ?? "";
+  const last = (bs: CompressionBlock[]) => bs[bs.length - 1]?.blockId ?? "";
+  const t2 = active.filter((b) => b.tier === 2);
+  if (t2.length >= config.tiers.tier3Trigger) {
+    return `Actionable now: condense tier-2 blocks ${first(t2)}..${last(t2)} into a single tier-3 block (compress({ content: [{ startId: "${first(t2)}", endId: "${last(t2)}", summary: "..." }] })).`;
+  }
+  const t1 = active.filter((b) => b.tier === 1);
+  if (t1.length >= config.tiers.tier2Trigger) {
+    return `Actionable now: distill tier-1 blocks ${first(t1)}..${last(t1)} into a single tier-2 block (compress({ content: [{ startId: "${first(t1)}", endId: "${last(t1)}", summary: "..." }] })).`;
+  }
+  return "";
+}
+
 async function handleCompress(args: CompressArgs, runtime: AcpRuntime, ctx: ExtensionContext, toolCallId?: string): Promise<string> {
   const maybeRanges = normalizeRanges(args);
   // Argument errors throw (not return): pi-agent-core only sets isError:true
@@ -159,26 +360,54 @@ async function handleCompress(args: CompressArgs, runtime: AcpRuntime, ctx: Exte
   const systemPromptTokens = systemPromptText ? defaultCountTokens(systemPromptText) : 0;
   const imageTokens = collectImageTokens(entries, modelSupportsImages(ctx.model));
   const sentTokens = estimateTokens(coreMessages, collectCoveredMessageIds(initialState), imageTokens) + systemPromptTokens;
+  // Same view-based recount as the context transform (issue #289): with blocks
+  // present, the raw-view count can sit far above the sent view and mis-scale
+  // this pass's emergency-truncate band before boundary resolution.
+  const firstTokenCount = adjustedTokenCount(runtime.core, coreMessages, initialState, config, sentTokens, imageTokens, systemPromptTokens);
   const turn = runtime.core.processTurn({
     messages: coreMessages,
     state: initialState,
     config,
-    tokenCount: calibrateTokens(sentTokens, runtime.density.densityFor(modelId)),
+    tokenCount: firstTokenCount,
   });
   const state = turn.state;
   const messages = turn.messages;
-  // Display-layer density alignment (doc §3.3): beforeTokens is calibrated to
-  // the same scale as the kernel's injected countTokens (which already carries
-  // density), so the numbers the model sees match real usage.
-  const density = runtime.density.densityFor(modelId);
-  const beforeTokens = calibrateTokens(estimateTokens(messages, collectCoveredMessageIds(state), imageTokens), density);
+  const sid = ctx.sessionManager.getSessionId();
+  // Issue #309: normalize at ingest — the kernel stores/renders summaries
+  // verbatim, so double-escaped \uXXXX runs would persist into every future
+  // prompt. Unverifiable user-quote claims are logged as evidence only.
+  const sanitizedRanges = ranges.map((r) => {
+    const span = `${r.startId}..${r.endId}`;
+    const s = sanitizeSummary(r.summary);
+    if (s.unescaped) {
+      debug.event("compress", { sid, event: "summary-unescaped", span, escapes: countUnicodeEscapes(r.summary), beforeLen: r.summary.length, afterLen: s.text.length });
+    }
+    const unverifiedQuote = findUnverifiableUserQuote(s.text);
+    if (unverifiedQuote !== null) {
+      logWarn("compress", { sid, event: "summary-unverifiable-quote", span, claim: unverifiedQuote });
+    }
+    return s.text === r.summary ? r : { ...r, summary: s.text };
+  });
+  const turnKey = lastTurnBoundaryId(entries, resolveHostSession(runtime.adapter)) ?? sid;
+  const snapshot = compressibleSnapshotText(turn.nudge);
+  if (runtime.compressRetryCappedFor(sid, turnKey)) {
+    logWarn("compress", { sid, event: "capped-reject", turnKey });
+    return cappedRejectionText(snapshot);
+  }
+  const visibleIds = new Set(messages.map((m) => m.id));
+  const deadSpans = ranges
+    .filter((r) => refIsDead(r.startId, state, visibleIds) || refIsDead(r.endId, state, visibleIds))
+    .map((r) => `${r.startId}..${r.endId}`);
+  const allDead = deadSpans.length === ranges.length;
+  // beforeTokens on the same CJK-aware scale as the kernel's countTokens, so
+  // "X → Y (~Z reclaimed)" compares like-for-like.
+  const beforeTokens = estimateTokens(messages, collectCoveredMessageIds(state), imageTokens);
   const summaryMaxChars = args.summaryMaxChars;
   const topLevelTopic = args.topic;
 
   debug.event("compress-in", {
     sid: ctx.sessionManager.getSessionId(),
     modelId,
-    density,
     ranges: ranges.length,
     spans: ranges.map((r) => ({ span: `${r.startId}..${r.endId}`, summaryLen: r.summary.length, summary: r.summary, topic: r.topic ?? topLevelTopic ?? null })),
     blocksBefore: state.blocks.length,
@@ -243,7 +472,7 @@ async function handleCompress(args: CompressArgs, runtime: AcpRuntime, ctx: Exte
   }
 
   const applied = runtime.core.applyCompression({
-    ranges: ranges.map((r) => ({ startRef: r.startId, endRef: r.endId, summary: r.summary, topic: r.topic ?? topLevelTopic, summaryMaxChars, compressCallId: toolCallId })),
+    ranges: sanitizedRanges.map((r) => ({ startRef: r.startId, endRef: r.endId, summary: r.summary, topic: r.topic ?? topLevelTopic, summaryMaxChars, compressCallId: toolCallId })),
     messages,
     state,
     config,
@@ -258,25 +487,40 @@ async function handleCompress(args: CompressArgs, runtime: AcpRuntime, ctx: Exte
       event: "tier3-rewrite-rejected",
       spans: rewriteSpans,
     });
+    const hint = tierReadyHint(state, config);
     throw new Error(
       `Range ${rewriteSpans.join(", ")} only re-condenses terminal tier-3 block(s) — T3 is the highest tier, so rewriting it reclaims nothing and can repeat forever (dog/billion-context-pi#3). Nothing was compressed. ` +
+        (hint ? `${hint} ` : "") +
         `Use search_context or decompress to retrieve details, or pick a range containing uncompressed messages (acp_status lists compressible ranges).`,
     );
   }
   await runtime.save(applied.state, ctx);
   const { blocksCreated, tokensCompressed, errors, warnings } = applied.result;
+  if (blocksCreated > 0) {
+    runtime.clearDeadCompress(sid);
+  } else if (allDead) {
+    const count = runtime.noteDeadCompress(sid, ranges.map((r) => `${r.startId}..${r.endId}`).join("|"));
+    if (count >= DEAD_REPEAT_REJECT) {
+      logWarn("compress", { sid, event: "dead-range-reject", count, spans: deadSpans });
+      return deadRepeatRejectionText(deadSpans, count, snapshot);
+    }
+  }
 
   // Re-measure the post-compression sent view on the SAME scale as beforeTokens
   // (post-processTurn view: visible text + every active block's summary anchor
   // + ref-tag overhead), so "X → Y (~Z reclaimed)" compares like-for-like —
   // including the new block's own summary, which the model will pay for next.
+  // Post-compression count: feeding the stale pre-compression sentTokens would
+  // mis-scale this pass's emergency-truncate band (threshold 0.95) and skew
+  // afterTokens (issue #289).
+  const postSentTokens = adjustedTokenCount(runtime.core, coreMessages, applied.state, config, estimateTokens(coreMessages, collectCoveredMessageIds(applied.state), imageTokens) + systemPromptTokens, imageTokens, systemPromptTokens);
   const afterTurn = runtime.core.processTurn({
     messages: coreMessages,
     state: applied.state,
     config,
-    tokenCount: calibrateTokens(sentTokens, density),
+    tokenCount: postSentTokens,
   });
-  const afterTokens = calibrateTokens(estimateTokens(afterTurn.messages, collectCoveredMessageIds(applied.state), imageTokens), density);
+  const afterTokens = estimateTokens(afterTurn.messages, collectCoveredMessageIds(applied.state), imageTokens);
   const reclaimed = Math.max(0, beforeTokens - afterTokens);
 
   const newBlocks = applied.state.blocks.slice(-blocksCreated);
@@ -313,7 +557,10 @@ async function handleCompress(args: CompressArgs, runtime: AcpRuntime, ctx: Exte
     logWarn("compress", { sid: ctx.sessionManager.getSessionId(), event: "warnings", count: warnings.length, warnings: warnings.slice(0, 5) });
   }
 
-  const lines = [`▣ ACP | ${formatK(beforeTokens)} → ${formatK(afterTokens)} tokens (~${formatK(reclaimed)} reclaimed, ${blocksCreated} block${blocksCreated > 1 ? "s" : ""})`];
+  const spanClause = blocksCreated > 0
+    ? `blocks: ${newBlocks.map((b) => blockSpanLabel(b, applied.state)).join(", ")}`
+    : "0 blocks";
+  const lines = [`▣ ACP | ${formatK(beforeTokens)} → ${formatK(afterTokens)} tokens (~${formatK(reclaimed)} reclaimed, ${spanClause})`];
   if (warnings.length > 0) lines.push("⚠️ " + warnings.join("; "));
   if (errors.length > 0) lines.push("Errors: " + errors.join("; "));
   return lines.join("\n");

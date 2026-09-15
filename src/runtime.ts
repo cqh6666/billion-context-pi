@@ -1,4 +1,5 @@
 import type { ExtensionContext, SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
+import { readFileSync } from "node:fs";
 import {
   createCore,
   defaultCountTokens,
@@ -8,12 +9,14 @@ import {
   type Config,
   type Prompts,
 } from "acp-kernel";
-import { resolveConfig, type AdapterConfig } from "./config.js";
-import { DensityEstimator } from "./density.js";
+import { resolveCompress, resolveConfig, type AdapterConfig } from "./config.js";
+import { applyStrictReasoningGate, resolveReasoningDrop, type CompressReasoningConfig } from "./reasoning-drop.js";
 import { entriesToCoreMessages, extractText, matchesStoredText, messageIdentity, messageRef } from "./messages.js";
-import { SessionStateStore, type LiveRefOrigin } from "./state.js";
+import { SessionStateStore, deriveChildState, type LiveRefOrigin } from "./state.js";
+import { hasCompressHistory, rebuildStateFromLog } from "./state-rebuild.js";
 import type { RolloverPending } from "./rollover.js";
 import { loadUserConfig, applyUserConfig } from "./user-config.js";
+import { sanitizeSurfaceConfig } from "./surface.js";
 import { ThrottleEpisode } from "./throttle-retry.js";
 import { logInfo, logWarn, setDebugEnabled } from "./log.js";
 import { findUniqueLongestRun, type MatchRange } from "./sequence-match.js";
@@ -40,8 +43,30 @@ export function isPiHost(sm: ExtensionContext["sessionManager"]): boolean {
   return typeof source.buildContextEntries === "function";
 }
 
+/** Minimal identity of a session for state operations that don't need a live
+ *  ExtensionContext (hosts deriving inline child sessions build these from
+ *  whatever session handles they hold). */
+export interface SessionRef {
+  sessionId: string;
+  sessionFile?: string;
+}
+
 export interface AcpRuntime {
   core: CompressionCore;
+  /** Set when the host is unsupported (currently: OMP / oh-my-pi) or when the
+   *  model's baseUrl routes through the billion-context wire proxy (#296).
+   *  Once true, the extension stands down: the context transform, system-prompt
+   *  injection, compaction-cancel and ACP tools all no-op so the host runs
+   *  untouched. Set at session_start (first context event as fallback). */
+  refused: boolean;
+  /** User-facing reason shown when a refused ACP tool is invoked; null means
+   *  the default OMP refusal text applies. Set together with `refused`. */
+  refusalMessage: string | null;
+  /** True when acp_delegate stood down this session because a third-party
+   *  subagent extension (pi-subagents) is installed and delegate.forceEnable
+   *  is not set (#415). Gates delegate tool registration and the system-prompt
+   *  delegate section. Reset on every session_start. */
+  delegateStoodDown: boolean;
   /** Per-session provider-throttle retry episode (attempt budget + kick
    *  pacing), keyed by session id so concurrent sessions in one extension
    *  instance cannot share an episode. Reset on session_start and on any
@@ -51,39 +76,43 @@ export interface AcpRuntime {
    *  pending kick sleep and releases the map entry so a long-lived process
    *  that cycles through many sessions doesn't accumulate them. */
   throttleDrop: (sid: string) => void;
+  /** Per-session tokenCount scale tracker (estimate vs provider). Returns true
+   *  when the scale just flipped (stale↔not-stale) so the caller can reset the
+   *  growth baseline — a cross-scale delta is a false artifact, not real growth
+   *  (issue #267). The first observation for a session never reports a flip. */
+  noteTokenScale: (sid: string, stale: boolean) => boolean;
+  /** Drop a session's token-scale tracker (session_shutdown). */
+  dropTokenScale: (sid: string) => void;
   store: SessionStateStore;
-  density: DensityEstimator;
-  /** 设置 countTokens 闭包使用的 modelId（每轮 context 事件调用）。 */
-  setCountModel(modelId: string): void;
-  /** Record this session's active block ids for the current context round;
-   *  returns true when a new active block appeared since the previous round
-   *  (i.e. a compress happened out-of-band — blocks are created by the
-   *  compress tool between context events, so they can never be detected by
-   *  comparing a single processTurn's input/output state). */
-  noteActiveBlocks(sid: string, activeBlockIds: string[]): boolean;
-  /** Drop per-session tracking state (session_start). */
-  clearSessionTracking(sid: string): void;
   adapter: AdapterConfig;
   setAdapter(adapter: AdapterConfig): void;
   prompts: Prompts;
   setPrompts(prompts: Prompts): void;
-  markNudgeShown(turnKey: string): void;
-  nudgeShownFor(turnKey: string): boolean;
+  markNudgeShown(sid: string, turnKey: string, tokenCount?: number): void;
+  nudgeShownFor(sid: string, turnKey: string): boolean;
+  /** tokenCount at the last actual nudge injection for this turn, for growth-aware re-inject (issue #269). */
+  nudgeShownTokensFor(sid: string, turnKey: string): number | undefined;
+  /** Clears the token-count stamps recorded by markNudgeShown — used on a token-scale flip (issue #267) so the same-turn re-inject floor (#269 / PR #316) is not computed against an old-scale stamp. */
+  clearNudgeTokenStamps(sid: string): void;
   /** Process compress toolResults for the CURRENT user turn only (the caller
    *  scopes the list — see collectCompressOutcomes in src/index.ts); idempotent
    *  per toolCallId. Outcome classes: isError or noop (0-block panel) →
    *  failure (count++), success panel (>= 1 block) → reset, other non-error
     *  text → neutral (count unchanged). Returns the failure count and
     *  whether the cap was just reached. */
-  noteCompressOutcomes(turnKey: string, outcomes: ReadonlyArray<{ toolCallId: string; isError: boolean; success: boolean; noop?: boolean }>): { count: number; cappedNow: boolean };
+  noteCompressOutcomes(sid: string, turnKey: string, outcomes: ReadonlyArray<{ toolCallId: string; isError: boolean; success: boolean; noop?: boolean }>): { count: number; cappedNow: boolean };
   /** True when this turn already burned MAX_COMPRESS_ATTEMPTS failed/no-op
    *  compress calls — used to stop re-injecting the (dedup-exempt) emergency
    *  nudge that would otherwise keep looping no-op compressions (issue #6). */
-  compressRetryCappedFor(turnKey: string): boolean;
-  clearNudgeTracking(): void;
-  clearCompressRetryTracking(): void;
+  compressRetryCappedFor(sid: string, turnKey: string): boolean;
+  clearNudgeTracking(sid: string): void;
+  clearCompressRetryTracking(sid: string): void;
   liveContextLimit(ctx: ExtensionContext): number;
   configFor(ctx: ExtensionContext): Config;
+  /** [#336] Effective compress.reasoning drop settings for the active model
+   *  (three-level merge + defaults). Feeds the request-time pass in the
+   *  context transform. */
+  reasoningDropFor(ctx: ExtensionContext): Required<CompressReasoningConfig>;
   /** Re-read ~/.<dir>/acp.json + <cwd>/<dir>/acp.json and re-derive the adapter
    *  config when the contents change. Cheap no-op when unchanged. Called at
    *  session_start and on every context event so config edits apply live. */
@@ -98,6 +127,16 @@ export interface AcpRuntime {
   /** Synchronous on purpose: callers do a read-modify-write of the pending
    *  list and need it atomic under parallel tool calls (no await between). */
   setRolloverPending(ctx: ExtensionContext, pending: RolloverPending | null): void;
+  /** #364 inline child sessions (same process, e.g. Prime RLM): derive the
+   *  child's compression state from another session's. Inherits blocks /
+   *  message refs / token snapshot so decompress + search_context keep working
+   *  on inherited blocks; resets every rhythm ledger (nudge cadence, stats,
+   *  absorb). One-time: writes a derivation marker into the child sidecar and
+   *  refuses to run again; also refuses when the child already owns real
+   *  (non-derived) blocks or when the parent has no blocks. Separate-process
+   *  pi-native delegates must NOT call this — their parentSession header
+   *  already inherits verbatim. Returns true when the child state was derived. */
+  deriveChildState(child: SessionRef, parent: SessionRef): Promise<boolean>;
   acquireLock(sid: string): Promise<() => void>;
   /** Per-session overflow self-heal state (learned window + armed emergency).
    *  Keyed by session id so concurrent sessions cannot share an episode. */
@@ -106,6 +145,15 @@ export interface AcpRuntime {
    *  the map entry so a long-lived process cycling through many sessions
    *  doesn't accumulate them. */
   overflowDrop(sid: string): void;
+  /** Record a compress call whose every requested range is dead (refs stale or
+   *  unknown — the kernel cannot create a block from it no matter what summary
+   *  is written). Returns the failure count for this exact range fingerprint
+   *  in this session (issue #250 loop breaker). */
+  noteDeadCompress(sid: string, fingerprint: string): number;
+  /** Drop a session's dead-range repeat tracking (a successful compress
+   *  renumbers refs so old fingerprints are meaningless; session_shutdown for
+   *  memory hygiene). */
+  clearDeadCompress(sid: string): void;
 }
 // omp fires the context event before the current user message is persisted to
 // the session branch, so merge event.messages (exact messages about to be sent,
@@ -247,20 +295,42 @@ function pruneOrphanRefs(state: CompressionState, messages: ReturnType<typeof en
 export const MAX_COMPRESS_ATTEMPTS = 3;
 
 export function createRuntime(adapter: AdapterConfig): AcpRuntime {
-  const density = new DensityEstimator();
-  let countModelId = "default";
   const core = createCore({
-    // 密度校准版 countTokens（Phase 2）：默认回落 defaultCountTokens（density=1）
-    countTokens: (text) => density.estimateWithDensity(countModelId, text),
+    // CJK-aware base counter (kernel default); the meter's real-scale floor
+    // (src/index.ts) covers provider-anchored calibration.
+    countTokens: defaultCountTokens,
   });
   const store = new SessionStateStore();
-  const lastActiveBlockIds = new Map<string, Set<string>>();
   const locks = new Map<string, Promise<void>>();
   const factoryAdapter = adapter;
   let adapterRef = adapter;
   let lastUserConfigKey: string | undefined;
   let promptsRef: Prompts = defaultPrompts;
-  const nudgeShownTurns = new Set<string>();
+  const nudgeShownTurns = new Map<string, Set<string>>();
+  const nudgeShownTokens = new Map<string, Map<string, number>>();
+  function markNudgeShown(sid: string, turnKey: string, tokenCount?: number): void {
+    let turns = nudgeShownTurns.get(sid);
+    if (!turns) { turns = new Set(); nudgeShownTurns.set(sid, turns); }
+    turns.add(turnKey);
+    if (tokenCount !== undefined) {
+      let toks = nudgeShownTokens.get(sid);
+      if (!toks) { toks = new Map(); nudgeShownTokens.set(sid, toks); }
+      toks.set(turnKey, tokenCount);
+    }
+  }
+  function nudgeShownFor(sid: string, turnKey: string): boolean {
+    return nudgeShownTurns.get(sid)?.has(turnKey) ?? false;
+  }
+  function nudgeShownTokensFor(sid: string, turnKey: string): number | undefined {
+    return nudgeShownTokens.get(sid)?.get(turnKey);
+  }
+  function clearNudgeTracking(sid: string): void {
+    nudgeShownTurns.delete(sid);
+    nudgeShownTokens.delete(sid);
+  }
+  function clearNudgeTokenStamps(sid: string): void {
+    nudgeShownTokens.delete(sid);
+  }
   // Per-session overflow self-heal state (learned window + armed emergency).
   const overflowEpisodes = new Map<string, OverflowEpisode>();
   function overflowFor(sid: string): OverflowEpisode {
@@ -270,6 +340,18 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
   }
   function overflowDrop(sid: string): void {
     overflowEpisodes.delete(sid);
+  }
+
+  const deadCompressCounts = new Map<string, Map<string, number>>();
+  function noteDeadCompress(sid: string, fingerprint: string): number {
+    let per = deadCompressCounts.get(sid);
+    if (!per) { per = new Map(); deadCompressCounts.set(sid, per); }
+    const count = (per.get(fingerprint) ?? 0) + 1;
+    per.set(fingerprint, count);
+    return count;
+  }
+  function clearDeadCompress(sid: string): void {
+    deadCompressCounts.delete(sid);
   }
 
   const throttleEpisodes = new Map<string, ThrottleEpisode>();
@@ -284,6 +366,23 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
     throttleEpisodes.delete(sid);
   }
 
+  // Per-session tokenCount scale (estimate vs provider). When the anchor flips
+  // stale↔not-stale the meter switches rulers; a growth delta spanning that
+  // switch is a false artifact (issue #267), so the caller resets the baseline.
+  const tokenScaleStale = new Map<string, boolean>();
+  function noteTokenScale(sid: string, stale: boolean): boolean {
+    const prev = tokenScaleStale.get(sid);
+    tokenScaleStale.set(sid, stale);
+    return prev !== undefined && prev !== stale;
+  }
+  function dropTokenScale(sid: string): void {
+    tokenScaleStale.delete(sid);
+  }
+
+  // [#361] session ids already logged for the strict-echo auto-disable, so the
+  // info event fires once per session rather than once per LLM call.
+  const strictEchoLogged = new Set<string>();
+
   // Compress-failure tracking (see wireContextTransform): counts FAILED/no-op
   // compress calls per user turn so the nudge circuit breaker can stop
   // re-injecting the nudge at a model that answers every nudge with another
@@ -293,38 +392,46 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
   // caller feeds only CURRENT-turn outcomes; success resets the counter,
   // neutral outcomes (non-error text that is not a success panel) leave it
   // frozen so mixed failure modes cannot bypass the cap.
-  const compressOutcomeSeen = new Set<string>();
-  let compressFailTurnKey: string | null = null;
-  let compressFailCount = 0;
+  interface CompressOutcomeTracker {
+    seen: Set<string>;
+    failTurnKey: string | null;
+    failCount: number;
+  }
+  const compressOutcomes = new Map<string, CompressOutcomeTracker>();
+  function compressTrackerFor(sid: string): CompressOutcomeTracker {
+    let t = compressOutcomes.get(sid);
+    if (!t) { t = { seen: new Set(), failTurnKey: null, failCount: 0 }; compressOutcomes.set(sid, t); }
+    return t;
+  }
 
-  function noteCompressOutcomes(turnKey: string, outcomes: ReadonlyArray<{ toolCallId: string; isError: boolean; success: boolean; noop?: boolean }>): { count: number; cappedNow: boolean } {
-    if (compressFailTurnKey !== turnKey) {
-      compressFailTurnKey = turnKey;
-      compressFailCount = 0;
+  function noteCompressOutcomes(sid: string, turnKey: string, outcomes: ReadonlyArray<{ toolCallId: string; isError: boolean; success: boolean; noop?: boolean }>): { count: number; cappedNow: boolean } {
+    const t = compressTrackerFor(sid);
+    if (t.failTurnKey !== turnKey) {
+      t.failTurnKey = turnKey;
+      t.failCount = 0;
     }
-    const prevCount = compressFailCount;
+    const prevCount = t.failCount;
     for (const o of outcomes) {
-      if (compressOutcomeSeen.has(o.toolCallId)) continue;
-      compressOutcomeSeen.add(o.toolCallId);
+      if (t.seen.has(o.toolCallId)) continue;
+      t.seen.add(o.toolCallId);
       if (o.isError || o.noop === true) {
-        compressFailCount += 1;
+        t.failCount += 1;
       } else if (o.success) {
-        compressFailCount = 0;
+        t.failCount = 0;
       }
       // neutral: counter untouched
     }
-    const cappedNow = compressFailCount >= MAX_COMPRESS_ATTEMPTS && prevCount < MAX_COMPRESS_ATTEMPTS;
-    return { count: compressFailCount, cappedNow };
+    const cappedNow = t.failCount >= MAX_COMPRESS_ATTEMPTS && prevCount < MAX_COMPRESS_ATTEMPTS;
+    return { count: t.failCount, cappedNow };
   }
 
-  function compressRetryCappedFor(turnKey: string): boolean {
-    return compressFailTurnKey === turnKey && compressFailCount >= MAX_COMPRESS_ATTEMPTS;
+  function compressRetryCappedFor(sid: string, turnKey: string): boolean {
+    const t = compressOutcomes.get(sid);
+    return t !== undefined && t.failTurnKey === turnKey && t.failCount >= MAX_COMPRESS_ATTEMPTS;
   }
 
-  function clearCompressRetryTracking(): void {
-    compressOutcomeSeen.clear();
-    compressFailTurnKey = null;
-    compressFailCount = 0;
+  function clearCompressRetryTracking(sid: string): void {
+    compressOutcomes.delete(sid);
   }
 
   async function acquireLock(sid: string): Promise<() => void> {
@@ -348,6 +455,23 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
     return resolveConfig(adapterRef, liveContextLimit(ctx), m?.provider, m?.id);
   }
 
+  function reasoningDropFor(ctx: ExtensionContext): Required<CompressReasoningConfig> {
+    const m = ctx.model as { provider?: string; id?: string; baseUrl?: string } | undefined;
+    const resolved = resolveReasoningDrop(resolveCompress(adapterRef.compress, m?.provider, m?.id).reasoning);
+    // [#361] strict-echo upstreams (DeepSeek thinking mode) must keep reasoning
+    // round-tripping or the rebuilt request 400s — force the pass off regardless
+    // of config so a thinking-mode session can't be broken by default drop:true.
+    const gated = applyStrictReasoningGate(resolved, m?.provider, m?.baseUrl);
+    if (resolved.drop && !gated.drop) {
+      const sid = ctx.sessionManager.getSessionId();
+      if (!strictEchoLogged.has(sid)) {
+        strictEchoLogged.add(sid);
+        logInfo("runtime", { sid, event: "compress-reasoning-auto-disabled", reason: "strict-echo-upstream", provider: m?.provider ?? null, issue: "#361" });
+      }
+    }
+    return gated;
+  }
+
   async function reloadConfig(cwd: string): Promise<void> {
     let user;
     try {
@@ -362,7 +486,7 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
       lastUserConfigKey = key;
       // Re-derive from the factory config (not adapterRef) so a key REMOVED from
       // acp.json actually reverts, instead of lingering from a prior apply.
-      adapterRef = applyUserConfig(factoryAdapter, user);
+      adapterRef = sanitizeSurfaceConfig(applyUserConfig(factoryAdapter, user));
       if (adapterRef.debug !== undefined) setDebugEnabled(adapterRef.debug);
       logInfo("runtime", { event: "config-reloaded", limit: adapterRef.modelContextLimit ?? null });
     } catch (e) {
@@ -374,8 +498,29 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
     const sm = ctx.sessionManager;
     const sessionFile = sm.getSessionFile() ?? undefined;
     const sessionId = sm.getSessionId();
-    const state = await store.load(sessionFile, sessionId);
+    let state = await store.load(sessionFile, sessionId);
     const entries = readContextEntries(sm);
+    // Issue #299 (ranxianglei/billion-context-pi#299): pi's importFromJsonl
+    // copies only the .jsonl, so the `${sessionFile}.acp.json` sidecar never
+    // travels with an imported session and compression state silently resets
+    // (the adapter then re-compresses already-compressed content). Last resort
+    // after the sidecar and parent-session inheritance both miss: replay the
+    // successful compress calls recorded in the session log itself. Uses only
+    // persisted entries — the omp live tail is not part of history yet.
+    if (sessionFile && state.blocks.length === 0 && hasCompressHistory(entries)) {
+      const rebuilt = rebuildStateFromLog({ entries, state, config: configFor(ctx), core });
+      if (rebuilt.report.blocks > 0) {
+        state = rebuilt.state;
+        await store.save(state, sessionFile, sessionId);
+        logInfo("state", {
+          sid: sessionId,
+          event: "state-rebuilt",
+          blocks: rebuilt.report.blocks,
+          callsApplied: rebuilt.report.callsApplied,
+          callsSkipped: rebuilt.report.callsSkipped,
+        });
+      }
+    }
     // omp fires the context event BEFORE the current user message is persisted
     // to the session branch (its agent-loop emits message_end only after
     // prepareProviderCall → transformContext), so getBranch() lags one message
@@ -405,20 +550,42 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
     const sm = ctx.sessionManager;
     return store.getRolloverPending(sm.getSessionFile() ?? undefined, sm.getSessionId());
   }
-  async function setRolloverPending(ctx: ExtensionContext, pending: RolloverPending | null): Promise<void> {
+  function setRolloverPending(ctx: ExtensionContext, pending: RolloverPending | null): void {
     const sm = ctx.sessionManager;
-    await store.setRolloverPending(sm.getSessionFile() ?? undefined, sm.getSessionId(), pending);
+    store.setRolloverPending(sm.getSessionFile() ?? undefined, sm.getSessionId(), pending);
   }
 
-  function noteActiveBlocks(sid: string, activeBlockIds: string[]): boolean {
-    const current = new Set(activeBlockIds);
-    const prev = lastActiveBlockIds.get(sid);
-    const isNew = prev !== undefined && activeBlockIds.some((id) => !prev.has(id));
-    lastActiveBlockIds.set(sid, current);
-    return isNew;
-  }
-  function clearSessionTracking(sid: string): void {
-    lastActiveBlockIds.delete(sid);
+  // Own-sidecar check (not cache/load) because load() may have already filled
+  // the slot via implicit parentSession-header inheritance — that implicit
+  // state is replaceable by an explicit derivation, but real self-compressed
+  // blocks are not.
+  function ownSidecarHasBlocks(sessionFile: string): boolean {
+    try {
+      const parsed = JSON.parse(readFileSync(`${sessionFile}.acp.json`, "utf8")) as { blocks?: unknown };
+      return Array.isArray(parsed.blocks) && parsed.blocks.length > 0;
+    } catch {
+      return false;
+    }
   }
 
-  return { core, store, density, setCountModel: (m) => { countModelId = m; }, noteActiveBlocks, clearSessionTracking, get adapter() { return adapterRef; }, setAdapter: (a) => { adapterRef = a; }, get prompts() { return promptsRef; }, setPrompts: (p) => { promptsRef = p; }, markNudgeShown: (k) => { nudgeShownTurns.add(k); }, nudgeShownFor: (k) => nudgeShownTurns.has(k), clearNudgeTracking: () => { nudgeShownTurns.clear(); }, noteCompressOutcomes, compressRetryCappedFor, clearCompressRetryTracking, liveContextLimit, configFor, reloadConfig, stateFor, save, getRolloverPending, setRolloverPending, acquireLock, overflowFor, overflowDrop, throttleFor, throttleDrop };}
+  async function deriveChild(child: SessionRef, parent: SessionRef): Promise<boolean> {
+    if (!child.sessionFile) return false;
+    if (ownSidecarHasBlocks(child.sessionFile)) return false;
+    // Materialize the child cache slot (also surfaces any implicit header
+    // inheritance or a marker persisted by an earlier process) so the marker
+    // below has a slot to attach to and save() persists it.
+    await store.load(child.sessionFile, child.sessionId);
+    if (store.getDerivedFrom(child.sessionFile, child.sessionId)) return false;
+    const parentState = await store.load(parent.sessionFile, parent.sessionId);
+    if (parentState.blocks.length === 0) return false;
+    const derived = deriveChildState(parentState);
+    store.setDerivedFrom(child.sessionFile, child.sessionId, { parentSessionId: parent.sessionId, derivedAt: Date.now() });
+    await store.save(derived, child.sessionFile, child.sessionId);
+    logInfo("state", { sid: child.sessionId, event: "child-state-derived", parentSid: parent.sessionId, blocks: derived.blocks.length });
+    return true;
+  }
+
+  let refused = false;
+  let refusalMessage: string | null = null;
+  let delegateStoodDown = false;
+  return { core, store, get refused() { return refused; }, set refused(v: boolean) { refused = v; }, get refusalMessage() { return refusalMessage; }, set refusalMessage(v: string | null) { refusalMessage = v; }, get delegateStoodDown() { return delegateStoodDown; }, set delegateStoodDown(v: boolean) { delegateStoodDown = v; }, get adapter() { return adapterRef; }, setAdapter: (a) => { adapterRef = a; }, get prompts() { return promptsRef; }, setPrompts: (p) => { promptsRef = p; }, markNudgeShown, nudgeShownFor, nudgeShownTokensFor, clearNudgeTracking, clearNudgeTokenStamps, noteCompressOutcomes, compressRetryCappedFor, clearCompressRetryTracking, liveContextLimit, configFor, reasoningDropFor, reloadConfig, stateFor, save, getRolloverPending, setRolloverPending, deriveChildState: deriveChild, acquireLock, overflowFor, overflowDrop, noteDeadCompress, clearDeadCompress, throttleFor, throttleDrop , noteTokenScale, dropTokenScale };}

@@ -56,6 +56,7 @@ function fakeCtx(entries: any[], stateFile: string, window: number) {
     ui: { notify: () => {}, setStatus: () => {}, setTitle: () => {}, setFooter: () => {}, setHeader: () => {}, note: () => {}, suggestForInput: () => {} },
     model: { contextWindow: window, id: "test-model" },
     sessionManager: {
+      buildContextEntries: () => entries,
       getBranch: () => entries,
       getEntries: () => entries,
       getSessionId: () => "rollover-test-session",

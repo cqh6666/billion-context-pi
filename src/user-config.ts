@@ -1,9 +1,12 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { homedir } from "node:os";
-import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME } from "./config-dir.js";
 import type { Prompts } from "acp-kernel";
-import type { AdapterConfig, CompressConfig, DelegateConfig } from "./config.js";
+import type { AdapterConfig, CompressConfig, DelegateConfig, HostSessionConfig, RepetitionGuardConfig } from "./config.js";
+import type { PiPromptSections } from "./system-prompt.js";
+import type { NudgeSectionsConfig, ToolPromptsConfig } from "./surface.js";
+import type { DegenerationGuardConfig } from "./degeneration.js";
 import type { ThrottleRetryConfig } from "./throttle-retry.js";
 import { debug, logWarn } from "./log.js";
 
@@ -11,6 +14,7 @@ import { debug, logWarn } from "./log.js";
  *  ~/.<CONFIG_DIR_NAME>/acp.json (global) and <cwd>/.<CONFIG_DIR_NAME>/acp.json
  *  (project-local overrides project-global). Project wins over global. */
 export interface UserAcpConfig {
+  enabled?: boolean;
   debug?: boolean;
   autoUpdate?: boolean;
   modelContextLimit?: number;
@@ -18,10 +22,18 @@ export interface UserAcpConfig {
   toolOutputMaxBytes?: number;
   delegate?: boolean | DelegateConfig;
   compress?: CompressConfig;
+  outputHeadroomMaxPct?: number | string;
   throttleRetry?: boolean | ThrottleRetryConfig;
+  repetitionGuard?: boolean | RepetitionGuardConfig;
+  degenerationGuard?: boolean | DegenerationGuardConfig;
   displayUsage?: "merged" | "separate";
   prompts?: Partial<Prompts>;
   acknowledgePromptsRisk?: boolean;
+  promptSections?: PiPromptSections;
+  nudgeSections?: NudgeSectionsConfig;
+  toolPrompts?: ToolPromptsConfig;
+  delegatePrompt?: string | null;
+  hostSession?: boolean | HostSessionConfig;
 }
 
 /** Read global + project acp.json, project overrides global. Returns {} on any
@@ -53,10 +65,14 @@ function join(... parts: string[]): string {
 }
 
 const KNOWN = new Set([
-  "debug", "autoUpdate", "modelContextLimit",
+  "enabled", "debug", "autoUpdate", "modelContextLimit",
   "toolBashDefaultTimeout", "toolOutputMaxBytes",
   "delegate", "compress", "displayUsage", "throttleRetry",
+  "outputHeadroomMaxPct",
+  "repetitionGuard", "degenerationGuard",
   "prompts", "acknowledgePromptsRisk",
+  "promptSections", "nudgeSections", "toolPrompts", "delegatePrompt",
+  "hostSession",
 ]);
 
 function pickKnown(parsed: Record<string, unknown>): UserAcpConfig {

@@ -11,10 +11,20 @@ export interface LiveRefOrigin {
   identity: string;
 }
 
+/** One-time marker persisted in a child sidecar when deriveChildState ran
+ *  (#364): proves this session's state was explicitly derived from a parent,
+ *  so later loads never re-derive. */
+export interface DerivedFrom {
+  parentSessionId: string;
+  derivedAt: number;
+}
+
 interface StateCacheSlot {
   state: CompressionState;
   liveRefOrigins: LiveRefOrigin[];
   rolloverPending: RolloverPending | null;
+  derivedFrom: DerivedFrom | null;
+  activePack?: string;
 }
 
 function stateFileFor(sessionFile: string | undefined): string | null {
@@ -60,14 +70,18 @@ export class SessionStateStore {
     let state = createInitialState();
     let liveRefOrigins: LiveRefOrigin[] = [];
     let rolloverPending: RolloverPending | null = null;
+    let derivedFrom: DerivedFrom | null = null;
+    let activePack: string | undefined;
     if (file) {
       try {
         const raw = await fs.readFile(file, "utf8");
-        const parsed = JSON.parse(raw) as CompressionState & { liveRefOrigins?: unknown; rolloverPending?: unknown };
+        const parsed = JSON.parse(raw) as CompressionState & { liveRefOrigins?: unknown; rolloverPending?: unknown; derivedFrom?: unknown; activePack?: unknown };
         if (parsed && Array.isArray(parsed.blocks)) {
           state = mergeInitialState(parsed);
           liveRefOrigins = parseLiveRefOrigins(parsed.liveRefOrigins);
           rolloverPending = parseRolloverPending(parsed.rolloverPending);
+          derivedFrom = parseDerivedFrom(parsed.derivedFrom);
+          if (typeof parsed.activePack === "string" && parsed.activePack) activePack = parsed.activePack;
         }
       } catch (e) {
         const code = (e as NodeJS.ErrnoException).code;
@@ -84,25 +98,47 @@ export class SessionStateStore {
         if (parentState) state = parentState;
       }
     }
-    this.cache.set(key, { state, liveRefOrigins, rolloverPending });
+    this.cache.set(key, { state, liveRefOrigins, rolloverPending, derivedFrom, activePack });
     return state;
+  }
+
+  /** Stamp the effective prompt pack for the live session (audit trail:
+   *  persisted into the sidecar on the next save). */
+  setActivePack(sessionFile: string | undefined, sessionId: string, activePack: string): void {
+    const key = cacheKey(sessionFile, sessionId);
+    const slot = this.cache.get(key);
+    if (slot) this.cache.set(key, { ...slot, activePack });
+  }
+
+  getActivePack(sessionFile: string | undefined, sessionId: string): string | undefined {
+    return this.cache.get(cacheKey(sessionFile, sessionId))?.activePack;
   }
 
   async save(state: CompressionState, sessionFile: string | undefined, sessionId: string): Promise<void> {
     const file = stateFileFor(sessionFile);
-    if (!file) return;
     const key = cacheKey(sessionFile, sessionId);
-    const slot = this.cache.get(key);
-    const liveRefOrigins = slot?.liveRefOrigins ?? [];
-    const rolloverPending = slot?.rolloverPending ?? null;
-    this.cache.set(key, { state, liveRefOrigins, rolloverPending });
+    const prev = this.cache.get(key);
+    const liveRefOrigins = prev?.liveRefOrigins ?? [];
+    const derivedFrom = prev?.derivedFrom ?? null;
+    const activePack = prev?.activePack;
+    const rolloverPending = prev?.rolloverPending ?? null;
+    // Cache update is unconditional: file-less (in-memory) sessions have no
+    // sidecar to persist, but their state must still survive across turns in
+    // this process — otherwise every compress result is dropped and the model
+    // re-compresses the same original context forever (issue #322).
+    this.cache.set(key, { state, liveRefOrigins, derivedFrom, activePack, rolloverPending });
+    if (!file) return;
     const dir = path.dirname(file);
     await fs.mkdir(dir, { recursive: true }).catch((e: unknown) => {
       logError("state", { event: "save-mkdir-failed", dir, error: e instanceof Error ? e.message : String(e) });
     });
     const tmp = path.join(dir, `.acp-tmp-${path.basename(file)}`);
     try {
-      await fs.writeFile(tmp, JSON.stringify({ ...state, liveRefOrigins, rolloverPending }), "utf8");
+      const payload: Record<string, unknown> = { ...state, liveRefOrigins };
+      if (derivedFrom) payload.derivedFrom = derivedFrom;
+      if (activePack) payload.activePack = activePack;
+      if (rolloverPending) payload.rolloverPending = rolloverPending;
+      await fs.writeFile(tmp, JSON.stringify(payload), "utf8");
       await fs.rename(tmp, file);
     } catch (e) {
       logError("state", { event: "save-failed", file, error: e instanceof Error ? e.message : String(e) });
@@ -116,7 +152,7 @@ export class SessionStateStore {
   setLiveRefOrigins(sessionFile: string | undefined, sessionId: string, origins: LiveRefOrigin[]): void {
     const key = cacheKey(sessionFile, sessionId);
     const slot = this.cache.get(key);
-    if (slot) this.cache.set(key, { state: slot.state, liveRefOrigins: [...origins], rolloverPending: slot.rolloverPending });
+    if (slot) this.cache.set(key, { state: slot.state, liveRefOrigins: [...origins], derivedFrom: slot.derivedFrom, activePack: slot.activePack, rolloverPending: slot.rolloverPending });
   }
 
   getRolloverPending(sessionFile: string | undefined, sessionId: string): RolloverPending | null {
@@ -126,7 +162,17 @@ export class SessionStateStore {
   setRolloverPending(sessionFile: string | undefined, sessionId: string, pending: RolloverPending | null): void {
     const key = cacheKey(sessionFile, sessionId);
     const slot = this.cache.get(key);
-    if (slot) this.cache.set(key, { state: slot.state, liveRefOrigins: slot.liveRefOrigins, rolloverPending: pending });
+    if (slot) this.cache.set(key, { state: slot.state, liveRefOrigins: slot.liveRefOrigins, derivedFrom: slot.derivedFrom, activePack: slot.activePack, rolloverPending: pending });
+  }
+
+  getDerivedFrom(sessionFile: string | undefined, sessionId: string): DerivedFrom | null {
+    return this.cache.get(cacheKey(sessionFile, sessionId))?.derivedFrom ?? null;
+  }
+
+  setDerivedFrom(sessionFile: string | undefined, sessionId: string, mark: DerivedFrom | null): void {
+    const key = cacheKey(sessionFile, sessionId);
+    const slot = this.cache.get(key);
+    if (slot) this.cache.set(key, { state: slot.state, liveRefOrigins: slot.liveRefOrigins, activePack: slot.activePack, rolloverPending: slot.rolloverPending, derivedFrom: mark });
   }
 
   invalidate(): void {
@@ -160,6 +206,36 @@ export class SessionStateStore {
     logWarn("state", { event: "parent-chain-exhausted", file: sessionFile, maxDepth: MAX_CHAIN_DEPTH });
     return undefined;
   }
+}
+
+function parseDerivedFrom(value: unknown): DerivedFrom | null {
+  if (!value || typeof value !== "object") return null;
+  const mark = value as { parentSessionId?: unknown; derivedAt?: unknown };
+  if (typeof mark.parentSessionId !== "string" || typeof mark.derivedAt !== "number") return null;
+  return { parentSessionId: mark.parentSessionId, derivedAt: mark.derivedAt };
+}
+
+/** #364: derive an INLINE child session's compression state from its parent's
+ *  (same-process sub-sessions, e.g. Prime RLM). Inherits exactly what makes
+ *  inherited blocks usable — blocks (deep-copied: they carry mutable fields),
+ *  message refs, the per-message token snapshot, and the id counters so new
+ *  child blocks cannot collide with inherited ids — and resets every rhythm
+ *  ledger (nudge cadence baseline, stats counters, absorb records) so the
+ *  child starts its own clock. Separate-process pi-native delegates must NOT
+ *  use this: their session files carry a parentSession header that already
+ *  inherits the parent state verbatim. */
+export function deriveChildState(parent: CompressionState): CompressionState {
+  const fresh = createInitialState();
+  return {
+    blocks: structuredClone(parent.blocks),
+    messageRefs: { byRaw: { ...parent.messageRefs.byRaw }, byRef: { ...parent.messageRefs.byRef } },
+    tokenSnapshot: { ...parent.tokenSnapshot },
+    nudge: fresh.nudge,
+    stats: fresh.stats,
+    absorbed: [],
+    nextBlockId: parent.nextBlockId,
+    nextRunId: parent.nextRunId,
+  };
 }
 
 function parseLiveRefOrigins(value: unknown): LiveRefOrigin[] {

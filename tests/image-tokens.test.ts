@@ -6,8 +6,8 @@ import { estimateTokens, collectImageTokens, modelSupportsImages, IMAGE_TOKEN_CO
 import { countImageBlocks } from "../src/messages.js";
 
 // Image blocks were invisible to the sent-view estimate (extractText drops
-// them), so usage under-counted image-heavy sessions and density calibration
-// chased a phantom gap (real includes image tokens, estimate did not).
+// them), so the meter under-counted image-heavy sessions (the provider's real
+// usage includes image tokens, the estimate did not).
 // dog/billion-context-pi#200.
 
 const STATE_FILE = "/tmp/pai-acp-image-tokens-it.session.json";

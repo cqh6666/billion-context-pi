@@ -8,7 +8,7 @@ import {
 } from "acp-kernel";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AcpRuntime } from "./runtime.js";
-import { estimateTokens, collectCoveredMessageIds, calibrateTokens } from "./tokens.js";
+import { estimateTokens, collectCoveredMessageIds, adjustedTokenCount } from "./tokens.js";
 import { formatTokens } from "./tag-tokens.js";
 
 export interface PendingCompression {
@@ -87,7 +87,6 @@ export interface RolloverInput {
   config: Config;
   coreMessages: CoreMessage[];
   turn: ProcessTurnResult;
-  modelId: string;
   imageTokens: Map<string, number>;
   systemPromptTokens: number;
 }
@@ -105,7 +104,7 @@ export interface RolloverResult {
 }
 
 export async function runRollover(input: RolloverInput): Promise<RolloverResult | null> {
-  const { runtime, ctx, config, coreMessages, turn, modelId, imageTokens, systemPromptTokens } = input;
+  const { runtime, ctx, config, coreMessages, turn, imageTokens, systemPromptTokens } = input;
   const pending = runtime.getRolloverPending(ctx);
   if (!pending || !pendingHasWork(pending)) return null;
   const p = pending;
@@ -150,12 +149,11 @@ export async function runRollover(input: RolloverInput): Promise<RolloverResult 
 
   const probe = runtime.core.processTurn({ messages: coreMessages, state, config, tokenCount: 0 });
   const newSentTokens = estimateTokens(probe.messages, collectCoveredMessageIds(state), imageTokens) + systemPromptTokens;
-  const newTokenCount = calibrateTokens(newSentTokens, runtime.density.densityFor(modelId));
+  const newTokenCount = adjustedTokenCount(runtime.core, coreMessages, state, config, newSentTokens, imageTokens, systemPromptTokens);
   const afterTurn = runtime.core.processTurn({ messages: coreMessages, state, config, tokenCount: newTokenCount });
 
-  const density = runtime.density.densityFor(modelId);
-  const beforeTokens = calibrateTokens(estimateTokens(turn.messages, collectCoveredMessageIds(turn.state), imageTokens), density);
-  const afterTokens = calibrateTokens(estimateTokens(afterTurn.messages, collectCoveredMessageIds(state), imageTokens), density);
+  const beforeTokens = estimateTokens(turn.messages, collectCoveredMessageIds(turn.state), imageTokens);
+  const afterTokens = estimateTokens(afterTurn.messages, collectCoveredMessageIds(state), imageTokens);
 
   return {
     turn: afterTurn,

@@ -10,7 +10,7 @@
 //      fires before the overflow).
 //   2. ARM an emergency: we force the next context event's usage to >=95% so
 //      the kernel's emergency nudge + tool-result truncate fire immediately,
-//      even if the density-calibrated estimate under-reports the sent view.
+//      even if the estimate under-reports the sent view.
 //
 // This is the extension-side mirror of the proxy's overflow self-heal
 // (billion-context PR #172). Unlike throttle-retry we do NOT rewrite the error
@@ -20,6 +20,8 @@
 // NOTE: the OVERFLOW_MARKER below is deliberately a superset of the
 // OVERFLOW_GUARD in src/throttle-retry.ts (which uses it to AVOID treating an
 // overflow as a throttle). Keep the two in sync when either changes.
+
+import { parsePercent } from "./config.js";
 
 // Detect a context-overflow error. Deliberately does NOT match Bedrock's
 // "too many tokens" throttle (a 429, handled by throttle-retry) — only
@@ -73,16 +75,46 @@ function toTokenNumber(raw: string | undefined): number | undefined {
   return Number.isFinite(n) && n >= 1000 ? n : undefined;
 }
 
+/** Default cap on the output-headroom reservation, as a fraction of the
+ *  context window (issue #207). Reserving the FULL registered max output
+ *  capability halves the effective input budget on models whose maxTokens is a
+ *  large share of the window (e.g. 131072 on a 262144 window → the 75% force-
+ *  compress band fires at ~37% of the full window), while real per-turn
+ *  replies rarely approach that. Capping at 25% keeps the guarantee where it
+ *  matters — any single-turn reply up to the reserved amount still fits at the
+ *  95% emergency threshold — while bounding the budget loss. A reply longer
+ *  than the reservation overflows once; the overflow self-heal (learned window
+ *  + armed emergency) recovers it on the next turn. */
+export const DEFAULT_OUTPUT_HEADROOM_MAX_PCT = 0.25;
+
+/** Resolve the user's `outputHeadroomMaxPct` (ratio or "N%" string) to a
+ *  numeric cap, falling back to DEFAULT_OUTPUT_HEADROOM_MAX_PCT when unset.
+ *  Shared by every headroom call site (context transform, /acp, acp_status)
+ *  so they all measure against the SAME capped limit (issue #207/#267). */
+export function resolveOutputHeadroomCap(value: number | string | undefined): number {
+  return value === undefined ? DEFAULT_OUTPUT_HEADROOM_MAX_PCT : parsePercent(value);
+}
+
 /**
  * Reserve the model's output budget from the context window, so the kernel's
- * nudge/truncate bands sit below (window - maxOutput) and the context always
- * leaves room for the model's reply. This prevents the "context + output >
- * window" overflow on a small window (agents routinely set a large max output).
+ * nudge/truncate bands sit below (window - reserved) and the context leaves
+ * room for the model's reply. This prevents the "context + output > window"
+ * overflow on a small window (agents routinely set a large max output).
+ *
+ * `capPct` bounds the reservation as a fraction of the window: reserved =
+ * min(maxOutput, capPct * window). The default (1) preserves the original
+ * full-capability reservation; the adapter passes DEFAULT_OUTPUT_HEADROOM_MAX_PCT
+ * (or the user's `outputHeadroomMaxPct`) so oversized registered capabilities
+ * no longer eat most of the input budget (issue #207). capPct semantics:
+ *   - 0            → no reservation (window returned unchanged)
+ *   - (0, 1)       → reservation capped at capPct * window
+ *   - >= 1         → legacy behavior (full maxOutput reserved)
+ *   - non-finite   → legacy behavior (treated as "not provided")
  * Returns the window unchanged when maxOutput is not usable (non-positive,
  * non-finite, or >= window — a maxOutput >= window request is degenerate and is
  * left to the overflow self-heal).
  */
-export function reserveOutputHeadroom(window: number, maxOutput: number): number {
+export function reserveOutputHeadroom(window: number, maxOutput: number, capPct: number = 1): number {
   if (
     Number.isFinite(window) &&
     window > 0 &&
@@ -90,7 +122,9 @@ export function reserveOutputHeadroom(window: number, maxOutput: number): number
     maxOutput > 0 &&
     maxOutput < window
   ) {
-    return window - maxOutput;
+    const cap = Number.isFinite(capPct) ? Math.max(0, Math.min(capPct, 1)) : 1;
+    const reserved = Math.min(maxOutput, cap * window);
+    return reserved > 0 ? window - reserved : window;
   }
   return window;
 }
@@ -109,6 +143,34 @@ export function reserveOutputHeadroom(window: number, maxOutput: number): number
  */
 export function shouldReserveOutputHeadroom(api: string | undefined): boolean {
   return api !== "anthropic-messages";
+}
+
+/**
+ * Apply the output-headroom reservation to a resolved config's modelContextLimit
+ * (see reserveOutputHeadroom / shouldReserveOutputHeadroom). Returns a NEW config
+ * (never mutates the input) so the shared resolved config stays untouched. Used
+ * by BOTH the live context transform and the read-only panel surfaces (/acp,
+ * acp_status) so every percentage is measured against the SAME real request
+ * limit — otherwise the panel reports against the full window while the nudge
+ * bands run against (window − maxOutput) (issue #267).
+ *
+ * `capPct` bounds the reservation as a fraction of the window (see
+ * reserveOutputHeadroom); callers pass resolveOutputHeadroomCap(
+ * adapter.outputHeadroomMaxPct) so the panel and the nudge bands share the
+ * same capped limit (issue #207). The default (1) preserves the legacy
+ * full-capability reservation for callers that don't pass a cap.
+ */
+export function applyOutputHeadroom<T extends { modelContextLimit: number }>(
+  config: T,
+  model: { maxTokens?: number; api?: string } | undefined,
+  capPct: number = 1,
+): T {
+  const maxOutput = model?.maxTokens ?? 0;
+  if (shouldReserveOutputHeadroom(model?.api)) {
+    const reserved = reserveOutputHeadroom(config.modelContextLimit, maxOutput, capPct);
+    if (reserved !== config.modelContextLimit) return { ...config, modelContextLimit: reserved };
+  }
+  return config;
 }
 
 // Per-session overflow self-heal state. Keyed by session id so concurrent

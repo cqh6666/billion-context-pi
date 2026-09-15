@@ -7,7 +7,7 @@ import type {
 import { applyAbsorb, defaultCountTokens } from "acp-kernel";
 import type { AcpRuntime } from "./runtime.js";
 import { logThrow } from "./log.js";
-import { estimateTokens, collectCoveredMessageIds, calibrateTokens } from "./tokens.js";
+import { estimateTokens, collectCoveredMessageIds, adjustedTokenCount } from "./tokens.js";
 import { getSystemPromptText } from "./compat.js";
 import { emptyPending } from "./rollover.js";
 
@@ -47,7 +47,6 @@ export function makeAbsorbTool(runtime: AcpRuntime): ToolDefinition<typeof Absor
 async function handleAbsorb(args: AbsorbArgs, runtime: AcpRuntime, ctx: ExtensionContext, toolCallId?: string): Promise<string> {
   const { state: initialState, coreMessages } = await runtime.stateFor(ctx);
   const config = runtime.configFor(ctx);
-  const modelId = (ctx.model as { id?: string } | undefined)?.id ?? "default";
   const systemPromptText = getSystemPromptText(ctx);
   const systemPromptTokens = systemPromptText ? defaultCountTokens(systemPromptText) : 0;
   const sentTokens = estimateTokens(coreMessages, collectCoveredMessageIds(initialState)) + systemPromptTokens;
@@ -55,7 +54,7 @@ async function handleAbsorb(args: AbsorbArgs, runtime: AcpRuntime, ctx: Extensio
     messages: coreMessages,
     state: initialState,
     config,
-    tokenCount: calibrateTokens(sentTokens, runtime.density.densityFor(modelId)),
+    tokenCount: adjustedTokenCount(runtime.core, coreMessages, initialState, config, sentTokens),
   });
   const ref = args.ref.trim();
   const pending = runtime.getRolloverPending(ctx);
