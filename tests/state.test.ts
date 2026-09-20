@@ -330,3 +330,26 @@ test("SessionStateStore round-trips activePack through the sidecar", async () =>
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("SessionStateStore reload preserves rules, nextRuleId, absorbed, terminalStreak (kernel 0.0.80+ fields)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "acp-state-fields-"));
+  const file = path.join(dir, "session.jsonl");
+  try {
+    const state = createInitialState();
+    state.rules.push({ id: "rule1", text: "keep exact file paths" });
+    state.nextRuleId = 2;
+    state.absorbed.push({ toolCallId: "call-1", callMessageId: "msg-1", resultMessageId: "msg-2", summary: "tool output absorbed", tokensReclaimed: 1234 });
+    state.terminalStreak = 3;
+    const store = new SessionStateStore();
+    await store.save(state, file, "s1");
+    const reloaded = new SessionStateStore();
+    const loaded = await reloaded.load(file, "s1");
+    assert.deepEqual(loaded.rules, [{ id: "rule1", text: "keep exact file paths" }], "persisted acp_rule records must survive reload");
+    assert.equal(loaded.nextRuleId, 2, "rule-id cursor must survive reload (never re-issued)");
+    assert.equal(loaded.absorbed?.length, 1, "absorb records must survive reload");
+    assert.equal(loaded.absorbed?.[0]?.tokensReclaimed, 1234);
+    assert.equal(loaded.terminalStreak, 3, "terminal-escape streak must survive reload");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

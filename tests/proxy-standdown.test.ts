@@ -1,7 +1,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { createAcpExtension } from "../src/index.js";
-import { isBiliProxyBaseUrl, PROXY_STAND_DOWN_MESSAGE } from "../src/proxy-detect.js";
+import { isBiliProxyBaseUrl, PROXY_STAND_DOWN_MESSAGE, nativeStandDownMessage } from "../src/proxy-detect.js";
 import { setRunNpmForTest } from "../src/update.js";
 
 // Hermetic session_start: the pi path runs the auto-update check, so disable
@@ -180,5 +180,69 @@ describe("proxied baseUrl stand-down (#296)", () => {
     const tool = api.tools.find((t: any) => t.name === "compress") as any;
     const res = await tool.execute("t1", {}, undefined, undefined, ctx);
     assert.equal((res.content[0] as any).text, PROXY_STAND_DOWN_MESSAGE);
+  });
+});
+
+describe("native-mode stand-down (#461)", () => {
+  test("detects BILLION_CONTEXT_NATIVE on a plain endpoint, stands down, warns once via UI", async () => {
+    process.env.BILLION_CONTEXT_NATIVE = "pi";
+    try {
+      const { api, handlers } = captureApi();
+      createAcpExtension()(api as any);
+      const notes: Array<{ msg: string; type?: string }> = [];
+      // Native mode rewrites traffic at the fetch layer — the configured baseUrl stays clean.
+      const ctx = piCtx((msg, type) => notes.push({ msg, type }), "https://api.openai.com/v1");
+
+      await startSession(handlers, ctx);
+
+      assert.equal(notes.length, 1, "warns exactly once");
+      assert.equal(notes[0]!.msg, nativeStandDownMessage("pi"));
+      assert.equal(notes[0]!.type, "warning");
+      // Stands down: does not cancel the host's own compaction (the native plugin owns compression).
+      assert.equal(handlers.get("session_before_compact")![0]!({}, {}), undefined);
+      // Does not inject the ACP system prompt.
+      assert.equal(handlers.get("before_agent_start")![0]!({ systemPrompt: "BASE" }, {}), undefined);
+      // Leaves the context untouched.
+      const ctxResult = await handlers.get("context")![0]!(
+        { type: "context", messages: [{ role: "user", content: "hi" }] },
+        ctx,
+      );
+      assert.equal(ctxResult, undefined, "context untouched on a native host");
+      // Tools report the native stand-down reason.
+      const tool = api.tools.find((t: any) => t.name === "compress") as any;
+      const res = await tool.execute("t1", {}, undefined, undefined, ctx);
+      assert.equal((res.content[0] as any).text, nativeStandDownMessage("pi"));
+    } finally {
+      delete process.env.BILLION_CONTEXT_NATIVE;
+    }
+  });
+
+  test("re-reads BILLION_CONTEXT_PROXY on events, catching values set after the factory ran", async () => {
+    delete process.env.BILLION_CONTEXT_PROXY;
+    delete process.env.BILLION_CONTEXT_NATIVE;
+    const { api, handlers } = captureApi();
+    createAcpExtension()(api as any);
+    // An async bootstrap (launcher/native) writes the env var AFTER the extension
+    // factory ran — the one-shot factory read missed it; the lazy guard must catch it.
+    process.env.BILLION_CONTEXT_PROXY = "1";
+    try {
+      const notes: string[] = [];
+      const ctx = piCtx((msg) => notes.push(msg), "https://api.openai.com/v1");
+
+      await startSession(handlers, ctx);
+
+      assert.equal(notes.length, 1, "warns via the lazy detection point");
+      assert.equal(notes[0], PROXY_STAND_DOWN_MESSAGE);
+      const ctxResult = await handlers.get("context")![0]!(
+        { type: "context", messages: [{ role: "user", content: "hi" }] },
+        ctx,
+      );
+      assert.equal(ctxResult, undefined, "context untouched");
+      const tool = api.tools.find((t: any) => t.name === "compress") as any;
+      const res = await tool.execute("t1", {}, undefined, undefined, ctx);
+      assert.equal((res.content[0] as any).text, PROXY_STAND_DOWN_MESSAGE);
+    } finally {
+      delete process.env.BILLION_CONTEXT_PROXY;
+    }
   });
 });

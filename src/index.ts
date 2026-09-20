@@ -12,17 +12,20 @@ import { join } from "node:path";
 import type { CoreMessage, NudgeDecision, CompressionBlock, Prompts } from "acp-kernel";
 import { renderNudgeText, resolvePrompts, defaultPrompts, viableRanges } from "acp-kernel";
 import { type AdapterConfig, resolveDelegate, resolveRollover, resolveHostSession, DEFAULT_DELEGATE_POLICY } from "./config.js";
-import { createRuntime, type AcpRuntime } from "./runtime.js";
+import { createRuntime, isPiHost, retryBreakerKey, type AcpRuntime } from "./runtime.js";
 import { makeCompressTool, isCompressSuccessText, isCompressNoopText } from "./compress-tool.js";
 import { makeAbsorbTool } from "./absorb-tool.js";
 import { makeDecompressTool } from "./decompress-tool.js";
 import { makeSearchTool } from "./search-tool.js";
 import { makeStatusTool } from "./status-tool.js";
+import { makeCacheTool } from "./cache-tool.js";
 import { makeDelegateTool, makeDelegateWaitTool, makeDelegateCancelTool, runningRunsSnapshot, resetDelegateUsage, setDelegateDisplayUsage, setDelegatePolicy, setDelegateDefaults, setDelegateNotifyIfRead, markDelegateResultRead, markDelegateRunReadByCommand } from "./delegate-tool.js";
 import { makeCommands } from "./commands.js";
 import { mergeSurface, readToolSurfaceWithPacks, resolveActivePack, resolvePackName, surfaceMetaOf } from "./prompt-pack.js";
 import type { NudgeSectionsConfig } from "./surface.js";
 import { coreOutToAgentMessages, extractText } from "./messages.js";
+import { liveOnlyTail } from "./live-only-tail.js";
+import { carryHostSystemMessages } from "./system-passthrough.js";
 import { countThinkingChars, dropCompressReasoning } from "./reasoning-drop.js";
 import { collapseAssistantDegeneration, degenerationNotice, lastAssistantRuns, resolveDegenerationGuard } from "./degeneration.js";
 import { buildAcpSystemPrompt, ACP_DELEGATE_PROMPT, ROLLOVER_PROMPT_SECTION } from "./system-prompt.js";
@@ -47,9 +50,9 @@ import {
 import { defaultCountTokens } from "acp-kernel";
 import { formatSystemPromptForEvent, getSystemPromptText } from "./compat.js";
 import { applyOutputHeadroom, inspectOverflowMessage, resolveOutputHeadroomCap } from "./overflow-selfheal.js";
-import { UNSUPPORTED_HOST_MESSAGE } from "./omp.js";
-import { isUnsupportedHost } from "./host.js";
-import { isBiliProxyBaseUrl, PROXY_STAND_DOWN_MESSAGE } from "./proxy-detect.js";
+import { FORK_HOST_WARNING_MESSAGE, UNSUPPORTED_HOST_MESSAGE } from "./omp.js";
+import { isDeclaredForkHost, isUnsupportedHost } from "./host.js";
+import { isBiliProxyBaseUrl, PROXY_STAND_DOWN_MESSAGE, nativeStandDownMessage } from "./proxy-detect.js";
 import { findPiSubagentsInstalls, resolveAgentDir, DELEGATE_STAND_DOWN_MESSAGE } from "./setup-subagent-tools.js";
 
 // Host-facing API for multi-session hosts (docs/host-adapter.md, #367): the
@@ -75,24 +78,41 @@ export function createAcpExtension(adapter: AdapterConfig = {}): ExtensionFactor
       return;
     }
     const runtime = createRuntime(adapter);
-    // Manual-wiring double-compression guard (issue #296): the launcher path
-    // exports BILLION_CONTEXT_PROXY (checked above), but a user who starts the
-    // proxy standalone (`bili start`) and points models.json baseUrl at
-    // http://127.0.0.1:PORT/bili/<scheme>://upstream... never sets the env var —
-    // without this check bcp and the proxy both compress every request. Yields
-    // exactly like the env path: stand down, let the proxy own compression.
+    // Double-compression guards (#296, #461): exactly one side may own
+    // compression. Three signals, ALL checked lazily on every event because
+    // none can be trusted at factory time:
+    //  - BILLION_CONTEXT_PROXY: exported by the `bili <client>` launchers
+    //    (inherited by the child), but never set by the standalone-proxy +
+    //    manual-wiring path below.
+    //  - /bili/ baseUrl prefix: manual wiring (#296) — `bili start` + models.json
+    //    baseUrl pointed at http://127.0.0.1:PORT/bili/<scheme>://upstream...
+    //    without the env var.
+    //  - BILLION_CONTEXT_NATIVE: set synchronously (before any await) by a
+    //    host-native entry's module evaluation (billion-context#820/#824) — the
+    //    ONLY signal visible in native mode, where the bootstrap writes
+    //    BILLION_CONTEXT_PROXY only after the proxy is up (past the synchronous
+    //    extension load) and the fetch-layer rewrite keeps the configured
+    //    baseUrl clean.
+    // The env vars are re-read on every call — an async bootstrap writes them
+    // after extensions load, so a one-shot factory read misses them (#461).
     // Checked lazily because ctx.model only exists on events, not in the
     // factory; warn once per process like the OMP refusal.
-    let proxyWarned = false;
+    let standDownWarned = false;
     const standDownIfProxied = (ctx: ExtensionContext): boolean => {
-      if (!isBiliProxyBaseUrl((ctx.model as { baseUrl?: string } | undefined)?.baseUrl)) return false;
+      const nativeHost = process.env.BILLION_CONTEXT_NATIVE || undefined;
+      if (
+        nativeHost === undefined &&
+        !process.env.BILLION_CONTEXT_PROXY &&
+        !isBiliProxyBaseUrl((ctx.model as { baseUrl?: string } | undefined)?.baseUrl)
+      ) return false;
+      const message = nativeHost !== undefined ? nativeStandDownMessage(nativeHost) : PROXY_STAND_DOWN_MESSAGE;
       runtime.refused = true;
-      runtime.refusalMessage = PROXY_STAND_DOWN_MESSAGE;
-      if (!proxyWarned) {
-        proxyWarned = true;
-        logWarn("host", { event: "proxy-baseurl-detected", sid: ctx.sessionManager.getSessionId(), action: "refused" });
-        if (ctx.hasUI) ctx.ui.notify(PROXY_STAND_DOWN_MESSAGE, "warning");
-        else console.error(PROXY_STAND_DOWN_MESSAGE);
+      runtime.refusalMessage = message;
+      if (!standDownWarned) {
+        standDownWarned = true;
+        logWarn("host", { event: nativeHost !== undefined ? "native-host-detected" : "proxy-detected", sid: ctx.sessionManager.getSessionId(), action: "refused", native: nativeHost ?? null });
+        if (ctx.hasUI) ctx.ui.notify(message, "warning");
+        else console.error(message);
       }
       return true;
     };
@@ -109,6 +129,7 @@ export function createAcpExtension(adapter: AdapterConfig = {}): ExtensionFactor
     pi.registerTool(makeDecompressTool(runtime, toolSurface.decompress));
     pi.registerTool(makeSearchTool(runtime, toolSurface.search_context));
     pi.registerTool(makeStatusTool(runtime, toolSurface.acp_status));
+    pi.registerTool(makeCacheTool(runtime, toolSurface.acp_cache));
     for (const { name, options } of makeCommands(runtime, pi)) {
       pi.registerCommand(name, options);
     }
@@ -174,6 +195,7 @@ function wireDelegateReadTracking(pi: ExtensionAPI): void {
 
 function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, standDownIfProxied: (ctx: ExtensionContext) => boolean): void {
   let ompWarned = false;
+  let forkWarned = false;
   let subagentStandDownWarned = false;
   pi.on("session_start", async (_event, ctx) => {
     // Unsupported hosts stand down (#234 / #364): any host without Pi's
@@ -196,11 +218,29 @@ function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       }
       return;
     }
+    // Declared fork hosts are admitted but carry a known limitation (#454):
+    // their in-process live-entries integration can drift the nudge's example
+    // refs from the session's real refs as the session grows, so compress
+    // calls may start failing with "does not exist in this session". Warn at
+    // admission instead of letting users discover it mid-session; root fix is
+    // tracked in #459. Log per session (support logs need the attribution),
+    // notify once per process like the refusal path above.
+    if (isDeclaredForkHost() && !isPiHost(ctx.sessionManager)) {
+      const sid = ctx.sessionManager.getSessionId();
+      logWarn("host", { event: "fork-host-admitted", sid, knownLimitation: "ref-drift", seeIssue: "#454", rootFix: "#459" });
+      if (!forkWarned) {
+        forkWarned = true;
+        if (ctx.hasUI) ctx.ui.notify(FORK_HOST_WARNING_MESSAGE, "warning");
+        else console.error(FORK_HOST_WARNING_MESSAGE);
+      }
+    }
     if (standDownIfProxied(ctx)) return;
     runtime.store.invalidate();
     runtime.clearNudgeTracking(ctx.sessionManager.getSessionId());
     runtime.throttleFor(ctx.sessionManager.getSessionId()).reset();
     runtime.clearCompressRetryTracking(ctx.sessionManager.getSessionId());
+    runtime.dropHostUsageSamples(ctx.sessionManager.getSessionId());
+    runtime.dropSizeDivergence(ctx.sessionManager.getSessionId());
     resetDelegateUsage();
     setDelegateDisplayUsage("separate");
     setDelegatePolicy(DEFAULT_DELEGATE_POLICY);
@@ -293,6 +333,8 @@ function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
     runtime.dropTokenScale(sid);
     runtime.clearNudgeTracking(sid);
     runtime.clearCompressRetryTracking(sid);
+    runtime.dropHostUsageSamples(sid);
+    runtime.dropSizeDivergence(sid);
     delegateStatusWidget.dispose();
     closeLogStream();
   });
@@ -378,7 +420,20 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       }
       const hostFloorActive = !usageAnchorPredatesCompression(entries);
       const realPromptTokens = realUsage?.tokens ?? 0;
-      const applyFloors = (base: number): number => Math.max(base, hostFloorActive ? realPromptTokens : 0, armedFloor);
+      // Calibration anchor (issue #455): the estimate carries systematic phantom
+      // mass (content counted locally that never goes on the wire) which the
+      // raise-only floors below can never pull down — in #452 the meter ran
+      // 1.5-2x above provider truth for the whole session and never re-anchored.
+      // When the provider measurement is FRESH (anchor postdates the last
+      // successful compress) and STABLE (recent samples agree), cap the estimate
+      // at measured × 1.2: density-scaling toward provider truth while keeping
+      // pre-send prediction for growth beyond the lagged-by-one-response
+      // measurement. Stale or jittering measurements fall back to the raw
+      // estimate; the divergence watch below keeps that fallback visible.
+      const hostUsageStable = hostFloorActive && realPromptTokens > 0 ? runtime.noteHostUsage(sid, realPromptTokens) : false;
+      const calibrate = (base: number): number =>
+        hostUsageStable ? Math.min(base, Math.ceil(realPromptTokens * 1.2)) : base;
+      const applyFloors = (base: number): number => Math.max(calibrate(base), hostFloorActive ? realPromptTokens : 0, armedFloor);
       let tokenCount = applyFloors(sentTokens);
       // View-based recount (issue #289): the raw-view estimate counts uncovered
       // messages that prune strips from the sent view every turn (orphaned tool
@@ -394,25 +449,38 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
           logInfo("turn", { sid, event: "view-recount", prelim: sentTokens, viewTokens: view.viewTokens, tokenCount });
         }
       }
-      // Growth scale guard (issue #267): the meter switches rulers when the
-      // anchor flips stale↔not-stale (estimate ↔ provider). A growth delta
-      // spanning that switch is a false artifact, not real growth, so reset the
-      // growth baselines on the flip: the T1 growth reference (lastNudgeShownTokens
-      // / lastPerMessageNudgeTokens) AND the per-tier cadence baselines
-      // (lastShownByTier, kernel 0.0.55: cadence = tokenCount - lastShownByTier[t]
-      // >= growthFloor) — an old-scale lastShown subtracted from a new-scale
-      // tokenCount is exactly the false "+35k growth" artifact from the issue.
-      // The extension-side re-inject stamps (#269 / PR #316) are reset too:
-      // growth for the same-turn re-inject is tokenCount - nudgeShownTokensFor(turnKey)
-      // and an old-scale stamp would fake a full-floor growth after the flip.
-      // The usage bands above keep the floor-stale behavior untouched — only
-      // the growth references are re-anchored.
+      // Divergence watch (issue #455): persistent >2x disagreement between the
+      // internal meter and the FRESH provider measurement means calibration
+      // could not engage (stale anchor or jittering usage) — warn once per
+      // episode instead of silently driving every threshold off the wrong ruler.
+      // With calibration engaged the capped tokenCount stays within 20% of the
+      // measurement, so this only fires in the fallback states it diagnoses.
+      const sizeDivergent = hostFloorActive && realPromptTokens > 0 && Math.abs(tokenCount - realPromptTokens) / realPromptTokens > 0.5;
+      if (runtime.noteSizeDivergence(sid, sizeDivergent)) {
+        logWarn("turn", { sid, event: "size-divergence", est: tokenCount, host: realPromptTokens, ratio: Number((tokenCount / realPromptTokens).toFixed(2)), stable: hostUsageStable });
+      }
+      // Growth scale guard (issue #267, re-anchored in #455): the meter switches
+      // rulers when the anchor flips stale↔not-stale (estimate ↔ provider). A
+      // growth delta spanning that switch is a false artifact, not real growth.
+      // Zeroing the baselines (the original fix) re-armed the kernel's one-shot
+      // first-sight-mass bypass on EVERY flip (it requires
+      // lastNudgeShownTokens === 0 && baseline === 0) — flips happen twice per
+      // compress cycle, so a sawtooth session kept treating the mass bypass as
+      // available and re-fired emergency nudges forever (#452/#455). Re-anchor
+      // existing references to the current tokenCount instead: growth since
+      // reference resets to zero, cadence baselines stay meaningful on the new
+      // ruler, and the mass bypass keeps its consumed state. Genuine cold starts
+      // (references already 0) are untouched and keep their one-shot.
       if (runtime.noteTokenScale(sid, !hostFloorActive)) {
-        state.nudge.lastNudgeShownTokens = 0;
-        state.nudge.lastPerMessageNudgeTokens = 0;
-        state.nudge.lastShownByTier = {};
+        state.nudge.lastNudgeShownTokens = state.nudge.lastNudgeShownTokens > 0 ? tokenCount : 0;
+        state.nudge.lastPerMessageNudgeTokens = state.nudge.lastPerMessageNudgeTokens > 0 ? tokenCount : 0;
+        const reanchored: Record<number, number> = {};
+        for (const [tier, shown] of Object.entries(state.nudge.lastShownByTier)) {
+          if (shown > 0) reanchored[Number(tier)] = tokenCount;
+        }
+        state.nudge.lastShownByTier = reanchored;
         runtime.clearNudgeTokenStamps(sid);
-        logInfo("growth-scale", { sid, event: "scale-flip-reset", anchorStale: !hostFloorActive });
+        logInfo("growth-scale", { sid, event: "scale-flip-reanchor", anchorStale: !hostFloorActive, tokenCount });
       }
       debug.event("context-in", {
         sid,
@@ -549,6 +617,11 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
     // outcome scoping); default-off keeps pi-native boundaries.
     const turnPolicy = resolveHostSession(runtime.adapter);
     const turnKey = lastTurnBoundaryId(entries, turnPolicy) ?? sid;
+    // #453: the retry breaker keys off PERSISTED boundaries only — under fork
+    // hosts the merged `entries` carry volatile live-N ids for the not-yet-
+    // persisted tail, so `turnKey` churns between context fires and would
+    // reset failCount mid-episode (cap never latches, emergency-inject loops).
+    const retryTurnKey = retryBreakerKey(ctx.sessionManager, turnPolicy) ?? sid;
 
     // Compress-outcome tracking feeds ONLY the nudge circuit breaker below:
     // failed/no-op attempts are counted (capped at MAX_COMPRESS_ATTEMPTS per
@@ -561,7 +634,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
     // the cap suppression sees the newest outcome (a success on this fire
     // must lift the cap on this same fire).
     const compressOutcomes = collectCompressOutcomes(entries, lastTurnBoundaryIndex(entries, turnPolicy));
-    const outcome = compressOutcomes.length > 0 ? runtime.noteCompressOutcomes(sid, turnKey, compressOutcomes) : null;
+    const outcome = compressOutcomes.length > 0 ? runtime.noteCompressOutcomes(sid, retryTurnKey, compressOutcomes) : null;
 
     // Growth-aware re-inject bookkeeping (issue #269) runs on EVERY context
     // event, not only when the kernel wants to inject: the drop re-anchor
@@ -625,7 +698,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       // keeps usage pinned at emergency). Once this turn burned
       // MAX_COMPRESS_ATTEMPTS attempts, stop re-injecting the nudge — the
       // kernel's emergency truncation still shrinks context mechanically.
-      const retryCapped = runtime.compressRetryCappedFor(sid, turnKey);
+      const retryCapped = runtime.compressRetryCappedFor(sid, retryTurnKey);
       const reInjectReady = shownAt === undefined || tokenCount - shownAt >= reInjectFloor;
       const alreadyShown = retryCapped || (!emergency && runtime.nudgeShownFor(sid, turnKey) && !reInjectReady);
       if (!alreadyShown) {
@@ -656,6 +729,28 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       if (ctx.hasUI) {
         ctx.ui.notify(`[ACP] compress failed ${outcome.count}× this turn — nudge paused until the next user message (emergency truncation still active).`);
       }
+    }
+
+    // #471 Re-append host-injected live-only messages (pi-web auto-name adds its
+    // instruction to event.messages without persisting an entry, so a Pi-host
+    // rebuild from entries alone drops them). null = no-op: normal turns align
+    // byte-for-byte and non-Pi hosts already merged live into entries. Append-only
+    // — never touches refs/blocks, so it stays orthogonal to the #459 ref churn.
+    const liveTail = liveOnlyTail(entries, event.messages);
+    if (liveTail && liveTail.length > 0) {
+      rebuilt.push(...liveTail);
+      logInfo("live-only-tail", { sid, event: "appended", tail: liveTail.length, outMsgs: rebuilt.length });
+    }
+
+    // #477 pi 0.86 carries the active toolset on the session system message
+    // (toolsAdded); provider adapters derive request `tools` from it. The
+    // rebuild sources messages from persisted entries, which never include the
+    // system message, so requests went out toolless. Carry the input's system
+    // message(s) back onto the rebuild; strict no-op on hosts without one.
+    const withHostSystem = carryHostSystemMessages(rebuilt, event.messages);
+    if (withHostSystem !== rebuilt) {
+      rebuilt = withHostSystem;
+      logInfo("system-passthrough", { sid, event: "carried", systems: event.messages.filter((m) => (m as { role?: unknown }).role === "system").length, outMsgs: rebuilt.length });
     }
 
     // Always return the transformed array: every message needs its [mNNNNN] ref

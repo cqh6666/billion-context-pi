@@ -34,3 +34,23 @@ export const PROXY_STAND_DOWN_MESSAGE = [
   "If your traffic reaches the proxy via HTTPS_PROXY instead (no /bili/ prefix in the URL), export BILLION_CONTEXT_PROXY=1 before starting pi.",
   "Docs: https://github.com/ranxianglei/billion-context",
 ].join("\n");
+
+/**
+ * Shown (and logged) when a billion-context host-native entry owns this
+ * process (issue #461): the native entry self-spawns an in-process proxy and
+ * rewrites model API traffic at the fetch layer, so running ACP in-process on
+ * top of it would double-compress every request. Its BILLION_CONTEXT_PROXY env
+ * var is written only after the proxy is up (past the synchronous extension
+ * load), and the fetch-layer rewrite keeps the configured baseUrl clean —
+ * BILLION_CONTEXT_NATIVE, set synchronously at module evaluation by the native
+ * entry (billion-context markNativeHost, #820/#824), is the only signal visible
+ * at our checkpoints. `host` is the marker value ("pi", "opencode", …) — kept
+ * in the text so a mismatched host is diagnosable from the warning alone.
+ */
+export function nativeStandDownMessage(host: string): string {
+  return [
+    `[billion-context-pi] billion-context native host detected (BILLION_CONTEXT_NATIVE=${host}) — the in-process native plugin proxies model API traffic and owns compression.`,
+    "ACP client-side compression has been disabled for this session to avoid double compression; nothing else to configure.",
+    "Docs: https://github.com/ranxianglei/billion-context",
+  ].join("\n");
+}

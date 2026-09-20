@@ -218,9 +218,11 @@ function parseDerivedFrom(value: unknown): DerivedFrom | null {
 /** #364: derive an INLINE child session's compression state from its parent's
  *  (same-process sub-sessions, e.g. Prime RLM). Inherits exactly what makes
  *  inherited blocks usable — blocks (deep-copied: they carry mutable fields),
- *  message refs, the per-message token snapshot, and the id counters so new
- *  child blocks cannot collide with inherited ids — and resets every rhythm
- *  ledger (nudge cadence baseline, stats counters, absorb records) so the
+ *  message refs, the per-message token snapshot, the id counters so new
+ *  child blocks cannot collide with inherited ids, and the persistent
+ *  acp_rule reminders (kernel cloneState precedent: never silently drop
+ *  model-set rules) — and resets every rhythm ledger (nudge cadence
+ *  baseline, stats counters, absorb records) so the
  *  child starts its own clock. Separate-process pi-native delegates must NOT
  *  use this: their session files carry a parentSession header that already
  *  inherits the parent state verbatim. */
@@ -233,6 +235,8 @@ export function deriveChildState(parent: CompressionState): CompressionState {
     nudge: fresh.nudge,
     stats: fresh.stats,
     absorbed: [],
+    rules: structuredClone(parent.rules ?? []),
+    nextRuleId: parent.nextRuleId ?? fresh.nextRuleId,
     nextBlockId: parent.nextBlockId,
     nextRunId: parent.nextRunId,
   };
@@ -277,6 +281,9 @@ function mergeInitialState(parsed: CompressionState): CompressionState {
     nudge: { ...fresh.nudge, ...(parsed.nudge ?? {}) },
     stats: { ...fresh.stats, ...(parsed.stats ?? {}) },
     absorbed: parseAbsorbedRecords(parsed.absorbed),
+    rules: parsed.rules ?? fresh.rules,
+    nextRuleId: parsed.nextRuleId ?? fresh.nextRuleId,
+    ...(parsed.terminalStreak !== undefined ? { terminalStreak: parsed.terminalStreak } : {}),
     nextBlockId: parsed.nextBlockId ?? fresh.nextBlockId,
     nextRunId: parsed.nextRunId ?? fresh.nextRunId,
   };

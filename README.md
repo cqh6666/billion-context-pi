@@ -135,6 +135,8 @@ billion-context-pi is built for the **Pi** coding agent (`@earendil-works/pi-cod
 
 - **Coexisting with the [billion-context](https://github.com/ranxianglei/billion-context) wire proxy** — running both on the same session double-compresses every request (wasted tokens, nested summaries, two ref coordinate systems). This is prevented automatically: launcher paths (`bili pi`, …) export `BILLION_CONTEXT_PROXY`, and models whose `baseUrl` routes through the proxy (`…/bili/https://upstream…`) are detected at session start — in both cases billion-context-pi stands down with a warning and leaves the proxy as the sole compressor. One exception: transparent mode, where traffic reaches the proxy via `HTTPS_PROXY` so the URL carries no `/bili/` prefix — that is undetectable from the URL, so export `BILLION_CONTEXT_PROXY=1` before starting pi in that case.
 
+- **Reverse collision — the `billion-context` thin plugin shadows `/acp`.** If the pi plugin shipped inside [`billion-context`](https://github.com/ranxianglei/billion-context) is also installed (an entry pointing at a `billion-context` install in `"packages"` of `~/.pi/agent/settings.json`, e.g. from `bili plugin install pi`), it registers its own `/acp` command, and Pi has no duplicate-command guard — which one answers depends on load order. Telling symptom: on a plain `pi` launch, typing `/acp` shows ``bili: no proxy detected (run via `bili <client>` or set a /bili/ baseURL)`` — that string is emitted by the thin plugin, **not** by billion-context-pi, and pi does not need `bili` running. Fix: the collision only bites when you launch plain `pi` — remove the thin plugin there (`bili plugin remove pi`, or drop the non-`npm:billion-context-pi` entry from that settings file) so billion-context-pi owns `/acp`. If you launch via `bili pi` instead, nothing needs removing: the launcher exports `BILLION_CONTEXT_PROXY` and billion-context-pi stands down entirely (bullet above), so both plugins may stay installed side by side. Note: `bili plugin install pi` removes an existing `npm:billion-context-pi` entry from that file without saying so ([billion-context#788](https://github.com/ranxianglei/billion-context/issues/788)).
+
 ## Model-facing tools
 
 | Tool | What it does |
@@ -144,6 +146,7 @@ billion-context-pi is built for the **Pi** coding agent (`@earendil-works/pi-cod
 | `decompress` | Restore a previously compressed block's content |
 | `search_context` | Search compressed block summaries (and visible messages) by keyword |
 | `acp_status` | Show context usage, compressed blocks, compressible ranges |
+| `acp_cache` | Prompt-cache reconciliation: grand ledger (input/cached/hit rate), per-request miss attribution, per-fold economics |
 | `acp_delegate` | Spawn a clean-context sub-agent for a task (review / research / implement / plan / advise) |
 | `acp_delegate_wait` | Block until a delegate run finishes (returns its result; times out otherwise) |
 | `acp_delegate_cancel` | Cancel a running delegate by runId |
@@ -183,7 +186,7 @@ If you already run another sub-agent extension (pi-subagents, pi-lens, …), tur
 ```
 
 - Equivalent object form: `{ "delegate": { "enabled": false } }`.
-- **What it removes:** the `acp_delegate`, `acp_delegate_wait` and `acp_delegate_cancel` tools, the `ACP_DELEGATE NOTIFICATIONS` system-prompt section, and the `ctrl+alt+f` fleet shortcut (`/acp-fleet` then reports that delegate is off). Compression is unaffected — `compress`, `decompress`, `search_context` and `acp_status` stay.
+- **What it removes:** the `acp_delegate`, `acp_delegate_wait` and `acp_delegate_cancel` tools, the `ACP_DELEGATE NOTIFICATIONS` system-prompt section, and the `ctrl+alt+f` fleet shortcut (`/acp-fleet` then reports that delegate is off). Compression is unaffected — `compress`, `decompress`, `search_context`, `acp_status` and `acp_cache` stay.
 - **When it applies:** the three tools are registered at session start, so a change needs a **new session** (or a Pi restart). The system-prompt section is resolved live on every turn, so it can disappear mid-session before the tools do.
 - Want to drop only the prompt section and keep the tools? Set `{ "delegatePrompt": null }`.
 - Pi's `--exclude-tools acp_delegate,acp_delegate_wait,acp_delegate_cancel` is **not** a substitute: it hides the tools but the model still receives the `ACP_DELEGATE NOTIFICATIONS` section describing tools it cannot call. Use `delegate: false`.

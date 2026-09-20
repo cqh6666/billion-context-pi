@@ -17,3 +17,19 @@ export const UNSUPPORTED_HOST_MESSAGE = [
   "  bili omp",
   "Docs: https://github.com/ranxianglei/billion-context",
 ].join("\n");
+
+/**
+ * Shown (and logged) when a session runs on a host that declared itself a
+ * Pi-compatible fork via PI_ACP_FORK_HOST (see ./host.ts). The declaration
+ * admits hosts whose in-process live-entries integration can drift the nudge's
+ * example refs from the session's real refs as the session grows, so compress
+ * calls may start failing with "does not exist in this session" (#454). Warn
+ * at admission instead of letting users discover it mid-session; root fix is
+ * tracked in #459, and long sessions on such hosts are safer on the proxy.
+ */
+export const FORK_HOST_WARNING_MESSAGE = [
+  "[billion-context-pi] Running on a declared fork host (PI_ACP_FORK_HOST). Known limitation: live-tail refs can drift as the session grows, so compress calls may start failing with \"does not exist in this session\" (#454). Root fix tracked in #459.",
+  "For long sessions on this host, prefer the billion-context proxy — it runs compression server-side and owns the ref coordinate space:",
+  "  npm install -g billion-context",
+  "  bili omp",
+].join("\n");

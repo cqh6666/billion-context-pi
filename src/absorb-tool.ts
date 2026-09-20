@@ -10,6 +10,7 @@ import { logThrow } from "./log.js";
 import { estimateTokens, collectCoveredMessageIds, adjustedTokenCount } from "./tokens.js";
 import { getSystemPromptText } from "./compat.js";
 import { emptyPending } from "./rollover.js";
+import { sanitizeSummary } from "./summary-sanitize.js";
 
 const AbsorbParams = Type.Object({
   ref: Type.String({ description: 'Message ref of the tool result to distill, e.g. "m00012" (from its acp tag).' }),
@@ -64,7 +65,7 @@ async function handleAbsorb(args: AbsorbArgs, runtime: AcpRuntime, ctx: Extensio
   }
   const outcome = applyAbsorb({
     ref,
-    summary: args.summary,
+    summary: sanitizeSummary(args.summary).text,
     absorbCallId: toolCallId,
     messages: turn.messages,
     state: turn.state,

@@ -21,6 +21,7 @@ import { ThrottleEpisode } from "./throttle-retry.js";
 import { logInfo, logWarn, setDebugEnabled } from "./log.js";
 import { findUniqueLongestRun, type MatchRange } from "./sequence-match.js";
 import { OverflowEpisode } from "./overflow-selfheal.js";
+import { lastTurnBoundaryId, type TurnBoundaryPolicy } from "./turn-boundary.js";
 // pi exposes `sessionManager.buildContextEntries()`; omp (oh-my-pi) only has
 // `getBranch()`. Both return chronological SessionEntry[]; feature-detect so
 // the adapter runs under either host (omp's runner silently swallows the TypeError).
@@ -41,6 +42,17 @@ export function readContextEntries(sm: ExtensionContext["sessionManager"]): Sess
 export function isPiHost(sm: ExtensionContext["sessionManager"]): boolean {
   const source = sm as unknown as SessionEntrySource;
   return typeof source.buildContextEntries === "function";
+}
+
+/** #453: key for the compress-retry circuit breaker, derived from PERSISTED
+ *  entries only. On fork hosts the live-merged tail carries volatile live-N
+ *  ids that renumber between context fires (the not-yet-persisted current
+ *  user message), so a breaker keyed on the merged view resets failCount
+ *  mid-episode and never latches (#452 log: cap → inject loop). Persisted
+ *  entry ids are immutable; this key changes only when a genuine new user
+ *  message reaches the session log. pi-native hosts see no change. */
+export function retryBreakerKey(sm: ExtensionContext["sessionManager"], policy?: TurnBoundaryPolicy): string | undefined {
+  return lastTurnBoundaryId(readContextEntries(sm), policy);
 }
 
 /** Minimal identity of a session for state operations that don't need a live
@@ -96,10 +108,12 @@ export interface AcpRuntime {
   clearNudgeTokenStamps(sid: string): void;
   /** Process compress toolResults for the CURRENT user turn only (the caller
    *  scopes the list — see collectCompressOutcomes in src/index.ts); idempotent
-   *  per toolCallId. Outcome classes: isError or noop (0-block panel) →
-   *  failure (count++), success panel (>= 1 block) → reset, other non-error
-    *  text → neutral (count unchanged). Returns the failure count and
-    *  whether the cap was just reached. */
+   *  per toolCallId. turnKey MUST be the stable persisted-boundary key
+   *  (retryBreakerKey) — a key derived from live-merged entries churns under
+   *  fork hosts and resets the counter mid-episode (#453). Outcome classes:
+   *  isError or noop (0-block panel) → failure (count++), success panel
+   *  (>= 1 block) → reset, other non-error text → neutral (count unchanged).
+   *  Returns the failure count and whether the cap was just reached. */
   noteCompressOutcomes(sid: string, turnKey: string, outcomes: ReadonlyArray<{ toolCallId: string; isError: boolean; success: boolean; noop?: boolean }>): { count: number; cappedNow: boolean };
   /** True when this turn already burned MAX_COMPRESS_ATTEMPTS failed/no-op
    *  compress calls — used to stop re-injecting the (dedup-exempt) emergency
@@ -154,6 +168,21 @@ export interface AcpRuntime {
    *  renumbers refs so old fingerprints are meaningless; session_shutdown for
    *  memory hygiene). */
   clearDeadCompress(sid: string): void;
+  /** Record one turn's FRESH-anchor provider usage sample and report whether
+   *  the recent window is stable enough to calibrate the internal estimate
+   *  against it (issue #455): >=3 of the last 4 samples agree within a 25%
+   *  spread. A jittering getContextUsage() must not become a moving cap, so
+   *  unstable windows report false and the raw estimate stands. */
+  noteHostUsage(sid: string, tokens: number): boolean;
+  /** Drop a session's host-usage stability window (session_shutdown). */
+  dropHostUsageSamples(sid: string): void;
+  /** Track persistent >2x internal-vs-provider size disagreement (issue #455);
+   *  returns true exactly once per episode — on the third consecutive
+   *  divergent turn — so the caller warns once instead of every turn. A
+   *  convergent turn ends the episode. */
+  noteSizeDivergence(sid: string, divergent: boolean): boolean;
+  /** Drop a session's size-divergence episode (session_shutdown). */
+  dropSizeDivergence(sid: string): void;
 }
 // omp fires the context event before the current user message is persisted to
 // the session branch, so merge event.messages (exact messages about to be sent,
@@ -379,6 +408,49 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
     tokenScaleStale.delete(sid);
   }
 
+  // [#455] Per-session window of FRESH-anchor provider usage samples. The
+  // calibration anchor caps the internal estimate at measured × headroom, but
+  // only while recent samples agree: a jittering getContextUsage() (±15K on
+  // near-identical views in the #452 log) must not become a moving cap.
+  const HOST_USAGE_WINDOW = 4;
+  const HOST_USAGE_MIN_SAMPLES = 3;
+  const HOST_USAGE_SPREAD_MAX = 0.25;
+  const hostUsageSamples = new Map<string, number[]>();
+  function noteHostUsage(sid: string, tokens: number): boolean {
+    if (tokens <= 0) return false;
+    let win = hostUsageSamples.get(sid);
+    if (!win) {
+      win = [];
+      hostUsageSamples.set(sid, win);
+    }
+    win.push(tokens);
+    if (win.length > HOST_USAGE_WINDOW) win.shift();
+    if (win.length < HOST_USAGE_MIN_SAMPLES) return false;
+    const lo = Math.min(...win);
+    const hi = Math.max(...win);
+    return (hi - lo) / lo <= HOST_USAGE_SPREAD_MAX;
+  }
+  function dropHostUsageSamples(sid: string): void {
+    hostUsageSamples.delete(sid);
+  }
+
+  // [#455] Persistent >2x internal-vs-provider disagreement, one warn per
+  // episode: fires on the third consecutive divergent turn, resets when the
+  // rulers converge or the session ends.
+  const sizeDivergenceStreaks = new Map<string, number>();
+  function noteSizeDivergence(sid: string, divergent: boolean): boolean {
+    if (!divergent) {
+      sizeDivergenceStreaks.delete(sid);
+      return false;
+    }
+    const streak = (sizeDivergenceStreaks.get(sid) ?? 0) + 1;
+    sizeDivergenceStreaks.set(sid, streak);
+    return streak === 3;
+  }
+  function dropSizeDivergence(sid: string): void {
+    sizeDivergenceStreaks.delete(sid);
+  }
+
   // [#361] session ids already logged for the strict-echo auto-disable, so the
   // info event fires once per session rather than once per LLM call.
   const strictEchoLogged = new Set<string>();
@@ -588,4 +660,4 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
   let refused = false;
   let refusalMessage: string | null = null;
   let delegateStoodDown = false;
-  return { core, store, get refused() { return refused; }, set refused(v: boolean) { refused = v; }, get refusalMessage() { return refusalMessage; }, set refusalMessage(v: string | null) { refusalMessage = v; }, get delegateStoodDown() { return delegateStoodDown; }, set delegateStoodDown(v: boolean) { delegateStoodDown = v; }, get adapter() { return adapterRef; }, setAdapter: (a) => { adapterRef = a; }, get prompts() { return promptsRef; }, setPrompts: (p) => { promptsRef = p; }, markNudgeShown, nudgeShownFor, nudgeShownTokensFor, clearNudgeTracking, clearNudgeTokenStamps, noteCompressOutcomes, compressRetryCappedFor, clearCompressRetryTracking, liveContextLimit, configFor, reasoningDropFor, reloadConfig, stateFor, save, getRolloverPending, setRolloverPending, deriveChildState: deriveChild, acquireLock, overflowFor, overflowDrop, noteDeadCompress, clearDeadCompress, throttleFor, throttleDrop , noteTokenScale, dropTokenScale };}
+  return { core, store, get refused() { return refused; }, set refused(v: boolean) { refused = v; }, get refusalMessage() { return refusalMessage; }, set refusalMessage(v: string | null) { refusalMessage = v; }, get delegateStoodDown() { return delegateStoodDown; }, set delegateStoodDown(v: boolean) { delegateStoodDown = v; }, get adapter() { return adapterRef; }, setAdapter: (a) => { adapterRef = a; }, get prompts() { return promptsRef; }, setPrompts: (p) => { promptsRef = p; }, markNudgeShown, nudgeShownFor, nudgeShownTokensFor, clearNudgeTracking, clearNudgeTokenStamps, noteCompressOutcomes, compressRetryCappedFor, clearCompressRetryTracking, liveContextLimit, configFor, reasoningDropFor, reloadConfig, stateFor, save, getRolloverPending, setRolloverPending, deriveChildState: deriveChild, acquireLock, overflowFor, overflowDrop, noteDeadCompress, clearDeadCompress, throttleFor, throttleDrop , noteTokenScale, dropTokenScale, noteHostUsage, dropHostUsageSamples, noteSizeDivergence, dropSizeDivergence };}

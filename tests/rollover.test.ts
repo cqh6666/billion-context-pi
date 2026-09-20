@@ -386,3 +386,33 @@ test("manual /acp-rollover applies pending work immediately", async () => {
     assert.ok(visibleIn(last, "user turn 12: "), "recent history must survive");
   });
 });
+
+test("rollover-mode pending record sanitizes double-escaped \\uXXXX summaries (#309 parity)", async () => {
+  await withStoreDir(async (dir) => {
+    const stateFile = join(dir, "session.jsonl");
+    const { api, handlers, tools } = captureApi();
+    createAcpExtension({ modelContextLimit: 200_000, rollover: true, autoUpdate: false, preserveRecentMessages: 1 })(api as any);
+    const entries: any[] = [entry("e1", "user", "中".repeat(6000)), entry("e2", "user", "中".repeat(6000))];
+    const ctx = fakeCtx(entries, stateFile, 200_000);
+    await handlers.get("context")![0]!({ type: "context", messages: entries.map((e) => e.message) }, ctx);
+
+    const compress = tools.find((t) => t.name === "compress")!;
+    // Padded so the DECODED form clears minSummaryLength (50): 4 + 25 + 4 + 25.
+    const escapedSummary = "摘要: " + "\\u5408".repeat(25) + " 结束。" + "尾".repeat(25);
+    assert.ok(escapedSummary.includes("\\u5408"), "precondition: literal escape runs in input");
+    const out = (await compress.execute(
+      "tc1",
+      { content: [{ startId: "m00001", endId: "m00001", summary: escapedSummary }] },
+      undefined, undefined, ctx,
+    )) as { content: { text: string }[] };
+    const text = out.content[0]!.text;
+    assert.ok(!text.includes("FAILED"), `compress failed: ${text}`);
+    assert.ok(text.includes("recorded for next rollover"), `expected pending panel, got: ${text}`);
+
+    const raw = JSON.parse(await readFile(`${stateFile}.acp.json`, "utf8"));
+    const recorded = raw.rolloverPending?.compressions?.[0] as { summary?: string } | undefined;
+    assert.ok(recorded, "no pending compression stored in acp state");
+    assert.ok(recorded.summary?.includes("合".repeat(25)), "stored summary must contain decoded CJK");
+    assert.ok(!recorded.summary?.includes("\\u5408"), "stored summary must not contain literal \\uXXXX runs");
+  });
+});

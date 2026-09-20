@@ -27,6 +27,9 @@ function makeParentState(): CompressionState {
   s.nudge.lastShownByTier[1] = 4000;
   s.stats.tokensCompressed = 999;
   s.stats.compressionCount = 2;
+  s.rules.push({ id: "rule1", text: "keep exact file paths in summaries" });
+  s.rules.push({ id: "rule2", text: "never drop error text" });
+  s.nextRuleId = 3;
   return s;
 }
 
@@ -61,6 +64,15 @@ test("deriveChildState carries the id counters so new blocks cannot collide", ()
   const child = deriveChildState(makeParentState());
   assert.equal(child.nextBlockId, 3);
   assert.equal(child.nextRunId, 7);
+  assert.equal(child.nextRuleId, 3, "rule ids must never be re-issued (id-never-reused)");
+});
+
+test("deriveChildState carries the parent's acp_rule reminders deep-copied", () => {
+  const parent = makeParentState();
+  const child = deriveChildState(parent);
+  assert.deepEqual(child.rules?.map((r) => r.id), ["rule1", "rule2"]);
+  child.rules?.push({ id: "rule3", text: "child-only" });
+  assert.equal(parent.rules?.length, 2, "child rule mutation must not leak into parent");
 });
 
 test("deriveChildState resets every rhythm ledger", () => {
