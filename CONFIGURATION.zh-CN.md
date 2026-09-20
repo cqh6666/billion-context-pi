@@ -132,6 +132,7 @@
 | `repetitionGuard` | boolean \| object | `true` | 🟢 ACTIVE | 打断字节级完全相同的工具调用死循环（连续 3 次告警，连续 5 次拦截并中止本轮）。 |
 | `degenerationGuard` | boolean \| object | `true` | 🟢 ACTIVE | 折叠出站视图中 assistant text/thinking 里的单字符退化连击（如 4655×「【」）并注入一次性恢复通知——打破 pi 每轮请求都回传退化 thinking 导致的连环 abort 死循环（#351）。 |
 | `hostSession` | boolean \| object | `false` | 🟢 ACTIVE | 多会话宿主的回合边界策略：是否把注入的 `custom_message` 计为回合起点。默认关闭（pi 原生行为）。 |
+| `rules` | boolean | `false` | 🟢 ACTIVE | 注册可选的 `acp_rule` 记录工具：简短、原则性的提醒，硬保护免于压缩。默认关闭。 |
 
 **delegate 键**
 
@@ -271,6 +272,19 @@
 - **默认值：** `无`（空）
 - **状态：** 🟢 ACTIVE
 - **说明：** 工具名模式（支持 glob 后缀）——仅匹配的**最近一次** call+result 对被硬排除在压缩之外（ref 渲染为 `BLOCKED`），更早的对仍可压缩。适用于每次调用取代上一次的累积快照型工具。校验规则与 `protectedTools` 相同。何时用哪个旋钮见 `protectedTools` 下的 ⚠ 说明。
+
+---
+
+## 规则
+
+`rules` 键控制 `acp_rule` 记录工具 —— 一个可选机制，把简短、原则性的提醒持久化在会话里，使其穿越上下文压缩。
+
+### `rules`
+
+- **类型：** `boolean`
+- **默认值：** `false`
+- **状态：** 🟢 ACTIVE
+- **说明：** 为 `true` 时，在会话启动时注册 `acp_rule` 工具。传入一条简短的提醒即记录（回显 `Recorded ruleN: …`）；不带参数调用则列出全部已记录规则。规则保存在会话 ACP 状态旁路文件中（重启后保留），并**硬保护免于压缩** —— 即使周围内容全部被压缩，其工具调用与结果仍保持可见。不涉及系统提示词：使用引导完全写在工具描述里，每轮不做任何重新注入。校验错误（空/超长/重复/超限）原样返回给模型。默认上限：最多 50 条 × 每条 300 字符。
 
 ---
 
