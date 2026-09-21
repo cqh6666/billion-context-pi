@@ -49,6 +49,14 @@ export function isCustomMessageEntry(entry: TurnBoundaryEntry): entry is TurnBou
   return extractText(entry.content).length > 0;
 }
 
+// Nudge persistence record (issue #326): written via pi.appendEntry as a
+// type:"custom" entry — never projected into the sent view (see above), so
+// the compact one-liner stays out of model context while surviving restarts.
+export const ACP_NUDGE_CUSTOM_TYPE = "acp-nudge";
+export interface AcpNudgeRecord {
+  text: string;
+}
+
 export function entriesToCoreMessages(entries: SessionEntry[]): CoreMessage[] {
   const out: CoreMessage[] = [];
   for (const entry of entries) {
