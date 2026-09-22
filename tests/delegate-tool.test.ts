@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildChildArgs, delegateSpawnOptions, injectedWaitMessage, buildWaitResult, buildCancelResult, getDelegateUsage, resetDelegateUsage, injectResult, effectiveExitCode, formatRunResult, resolveWaitTimeoutMs, findUndeliveredRuns, undeliveredNoticeFrom, buildRecoveryNotice, makeDelegateTool, exitLabel, cancelledFileNote, delegateStdinText, readActivityTail, scheduleRunNotification, flushDelegateNotifications, formatBatchRunSection, setDelegatePolicy, delegateChildEnv, asyncWatchdogDescription, ConcurrencyGate, setDelegateDefaults, resetDelegateDefaults, isValidThinkingLevel, resolvePerCallTimeoutMs } from "../src/delegate-tool.js";
+import { buildChildArgs, delegateSpawnOptions, injectedWaitMessage, buildWaitResult, buildCancelResult, getDelegateUsage, resetDelegateUsage, injectResult, effectiveExitCode, formatRunResult, resolveWaitTimeoutMs, findUndeliveredRuns, undeliveredNoticeFrom, buildRecoveryNotice, makeDelegateTool, exitLabel, cancelledFileNote, delegateStdinText, readActivityTail, scheduleRunNotification, flushDelegateNotifications, formatBatchRunSection, setDelegatePolicy, delegateChildEnv, asyncWatchdogDescription, ConcurrencyGate, setDelegateDefaults, resetDelegateDefaults, isValidThinkingLevel, resolvePerCallTimeoutMs, isSilentNoOp, silentNoOpDiagnosis, OUT_DIR } from "../src/delegate-tool.js";
 import { DEFAULT_DELEGATE_POLICY } from "../src/config.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -1121,5 +1121,141 @@ test("ConcurrencyGate: cancelling a queued run skips it without leaking a slot",
   assert.deepEqual(order, ["a", "c"], "cancelled b never launched");
   assert.equal(gate.activeCount, 1);
   assert.equal(gate.queuedCount, 0);
+});
+
+// ─── #506: exit-0 with no delivered final answer must fail loudly ───────────
+
+test("isSilentNoOp: exit 0 without final answer fails unless the run ended on a tool act", () => {
+  assert.equal(isSilentNoOp(0, "", null), true, "no observable activity at all");
+  assert.equal(isSilentNoOp(0, "", "thinking"), true, "thinking-only stall");
+  assert.equal(isSilentNoOp(0, "", "reply"), true, "empty final text block");
+  assert.equal(isSilentNoOp(0, "", "tool"), false, "ended on tool execution (work persisted)");
+  assert.equal(isSilentNoOp(0, "answer", "thinking"), false, "delivered text is a success");
+  assert.equal(isSilentNoOp(1, "", "thinking"), false, "non-zero exit already fails via code");
+  assert.equal(isSilentNoOp(null, "", "thinking"), false, "null code handled by effectiveExitCode path");
+});
+
+test("silentNoOpDiagnosis names the stall shape and likely causes", () => {
+  const thinking = silentNoOpDiagnosis({ toolStarts: 2, thinkingChars: 27000, lastSubstantive: "thinking" });
+  assert.match(thinking, /NO final answer delivered despite exit 0/);
+  assert.match(thinking, /thinking segment/);
+  assert.ok(thinking.includes("27,000"), "thinking char count shown");
+  assert.match(thinking, /thinking budget exhausted/);
+  const none = silentNoOpDiagnosis({ toolStarts: 0, thinkingChars: 0, lastSubstantive: null });
+  assert.match(none, /no observable output at all/);
+  const emptyText = silentNoOpDiagnosis({ toolStarts: 0, thinkingChars: 5, lastSubstantive: "reply" });
+  assert.match(emptyText, /final text block was empty/);
+});
+
+// e2e via PI_CLI_PATH: the delegate child is a fake `pi --mode json` CLI that
+// emits a scripted event stream and exits 0 — exactly the surface finalize
+// sees in production (stdout events + exit code).
+
+const FAKE_CLI_THINKING_STALL = `
+process.stdin.resume();
+const w = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+w({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "x".repeat(6000) } });
+w({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "y".repeat(6000) } });
+w({ type: "message_update", assistantMessageEvent: { type: "thinking_end", contentIndex: 0 } });
+w({ type: "agent_settled" });
+process.exit(0);
+`;
+
+const FAKE_CLI_TOOL_THEN_TEXT = `
+process.stdin.resume();
+const w = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+w({ type: "tool_execution_start", toolCallId: "c1", toolName: "edit", args: { path: "a.txt" } });
+w({ type: "tool_execution_end", toolCallId: "c1", toolName: "edit", isError: false });
+w({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "done: edited a.txt" } });
+w({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "done: edited a.txt" } });
+process.exit(0);
+`;
+
+const FAKE_CLI_TOOL_THEN_STALL = `
+process.stdin.resume();
+const w = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+w({ type: "tool_execution_start", toolCallId: "c1", toolName: "read", args: { path: "b.txt" } });
+w({ type: "tool_execution_end", toolCallId: "c1", toolName: "read", isError: false });
+w({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "z".repeat(4000) } });
+w({ type: "message_update", assistantMessageEvent: { type: "thinking_end", contentIndex: 0 } });
+w({ type: "agent_settled" });
+process.exit(0);
+`;
+
+async function runFakePiDelegate(sent: string[], script: string): Promise<{ runId: string; message: string }> {
+  const cliFile = join(tmpdir(), `acp-fake-pi-${Date.now()}-${Math.random().toString(36).slice(2)}.js`);
+  await writeFile(cliFile, script, "utf8");
+  const prevCliPath = process.env.PI_CLI_PATH;
+  process.env.PI_CLI_PATH = cliFile;
+  try {
+    const pi = { sendUserMessage: (t: string) => sent.push(t) } as unknown as Parameters<typeof makeDelegateTool>[0];
+    const tool = makeDelegateTool(pi);
+    const ctx = { ...mockCtx("pi"), mode: "tui", cwd: process.cwd() } as unknown as ExtensionContext;
+    const res = await tool.execute(`tc-506-${Date.now()}`, { agent: "oracle", task: "e2e silent-noop check", async: true }, undefined, undefined, ctx);
+    const launch = (res.content[0] as { text?: string }).text ?? "";
+    const runId = /runId \`([^\`]+)\`/.exec(launch)?.[1];
+    assert.ok(runId, `runId present in launch message: ${launch}`);
+    // Completion notifications are coalesced (trailing window up to ~2s), so poll.
+    const deadline = Date.now() + 15_000;
+    while (sent.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(sent.length, 1, `exactly one injected notification, got ${sent.length}`);
+    return { runId: runId!, message: sent[0]! };
+  } finally {
+    if (prevCliPath === undefined) delete process.env.PI_CLI_PATH;
+    else process.env.PI_CLI_PATH = prevCliPath;
+    await rm(cliFile, { force: true });
+  }
+}
+
+function cleanupRunFiles(runId: string): Promise<void[]> {
+  return Promise.all([
+    rm(join(OUT_DIR, `${runId}.out`), { force: true }),
+    rm(join(OUT_DIR, `${runId}.activity`), { force: true }),
+    rm(join(OUT_DIR, `${runId}.session.jsonl`), { force: true }),
+  ]);
+}
+
+test("#506 e2e: thinking-only exit-0 run is reported FAILED with diagnosis, not completed", async () => {
+  const sent: string[] = [];
+  const { runId, message } = await runFakePiDelegate(sent, FAKE_CLI_THINKING_STALL);
+  try {
+    assert.match(message, /FAILED/, "loud failure header");
+    assert.ok(!message.includes("[acp_delegate completed]"), "no completed header");
+    assert.ok(message.includes(runId), "names the failed run");
+    assert.match(message, /NO final answer delivered despite exit 0/);
+    assert.match(message, /thinking segment/);
+    assert.match(message, /thinking budget exhausted/);
+    const outText = await readFile(join(OUT_DIR, `${runId}.out`), "utf8").catch(() => "");
+    assert.ok(outText.includes("(no output)"), "result file carries the backfill marker");
+  } finally {
+    await cleanupRunFiles(runId);
+  }
+});
+
+test("#506 e2e: run ending with delivered text after tools stays completed (no false positive)", async () => {
+  const sent: string[] = [];
+  const { runId, message } = await runFakePiDelegate(sent, FAKE_CLI_TOOL_THEN_TEXT);
+  try {
+    assert.match(message, /\[acp_delegate completed\]/, "completed header kept");
+    assert.ok(!message.includes("FAILED"), "no failure marker");
+    const outText = await readFile(join(OUT_DIR, `${runId}.out`), "utf8").catch(() => "");
+    assert.ok(outText.includes("done: edited a.txt"), "reply text persisted to the result file");
+  } finally {
+    await cleanupRunFiles(runId);
+  }
+});
+
+test("#506 e2e: tool activity followed by a thinking stall still fails (reviewer-stall case)", async () => {
+  const sent: string[] = [];
+  const { runId, message } = await runFakePiDelegate(sent, FAKE_CLI_TOOL_THEN_STALL);
+  try {
+    assert.match(message, /FAILED/, "stall after tools is still a loud failure");
+    assert.match(message, /NO final answer delivered despite exit 0/);
+    assert.match(message, /~4,000 thinking chars, 1 tool call/);
+  } finally {
+    await cleanupRunFiles(runId);
+  }
 });
 

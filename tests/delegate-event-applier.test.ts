@@ -147,3 +147,68 @@ test("tool activity goes to activity file, not reply", () => {
 	assert.equal(reply.text, "answer");
 	assert.match(activity.text, /\[tool\] bash echo hi/);
 });
+
+function toolStart(name = "bash"): string {
+	return `{"type":"tool_execution_start","toolCallId":"c1","toolName":${JSON.stringify(name)},"args":{"path":"f"}}`;
+}
+
+function toolEnd(): string {
+	return '{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","isError":false}';
+}
+
+// ─── #506: activity stats feed the silent-no-op verdict ─────────────────────
+
+test("getStats: pristine applier reports no substantive activity", () => {
+	const { applier } = makeHarness();
+	assert.deepEqual(applier.getStats(), { toolStarts: 0, thinkingChars: 0, lastSubstantive: null });
+});
+
+test("getStats: thinking-only stream ends on thinking with char count", () => {
+	const { applier } = makeHarness();
+	applier.handleEventLine(thinkingDelta("abc"));
+	applier.handleEventLine(thinkingDelta("defgh"));
+	applier.handleEventLine(thinkingEnd());
+	assert.deepEqual(applier.getStats(), { toolStarts: 0, thinkingChars: 8, lastSubstantive: "thinking" });
+});
+
+test("getStats: reply after tools ends on reply and counts tool starts", () => {
+	const { applier } = makeHarness();
+	applier.handleEventLine(toolStart());
+	applier.handleEventLine(toolEnd());
+	applier.handleEventLine(delta("answer"));
+	applier.handleEventLine(end("answer"));
+	assert.deepEqual(applier.getStats(), { toolStarts: 1, thinkingChars: 0, lastSubstantive: "reply" });
+});
+
+test("getStats: run ending right after a tool execution ends on tool", () => {
+	const { applier } = makeHarness();
+	applier.handleEventLine(toolStart());
+	applier.handleEventLine(toolEnd());
+	assert.deepEqual(applier.getStats(), { toolStarts: 1, thinkingChars: 0, lastSubstantive: "tool" });
+});
+
+test("getStats: thinking after a tool execution overrides the tool class (stall signature)", () => {
+	const { applier } = makeHarness();
+	applier.handleEventLine(toolStart("read"));
+	applier.handleEventLine(toolEnd());
+	applier.handleEventLine(thinkingDelta("stalling…"));
+	applier.handleEventLine(thinkingEnd());
+	assert.deepEqual(applier.getStats(), { toolStarts: 1, thinkingChars: 9, lastSubstantive: "thinking" });
+});
+
+test("getStats: appendRaw (omp fallback) counts as reply", () => {
+	const { applier } = makeHarness();
+	applier.appendRaw("plain reply");
+	assert.equal(applier.getStats().lastSubstantive, "reply");
+});
+
+test("getStats: control-flow events (retry, usage, settled) never change the class", () => {
+	const { applier } = makeHarness();
+	applier.handleEventLine(thinkingDelta("x"));
+	applier.handleEventLine(thinkingEnd());
+	applier.handleEventLine('{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":100,"errorMessage":"boom"}');
+	applier.handleEventLine('{"type":"auto_retry_end","success":true,"attempt":1}');
+	applier.handleEventLine('{"type":"message_end","message":{"role":"assistant","usage":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":3}}}');
+	applier.handleEventLine('{"type":"agent_settled"}');
+	assert.equal(applier.getStats().lastSubstantive, "thinking", "still the pre-retry thinking segment");
+});

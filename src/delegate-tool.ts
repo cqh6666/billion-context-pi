@@ -472,9 +472,26 @@ export interface EventApplierWriters {
   activity: { write(chunk: string): void } | null;
 }
 
+/** Class of the last substantive event observed in a delegate run: reply
+ *  text, tool activity, or a completed thinking segment. null = nothing
+ *  substantive happened at all. */
+export type FinalActivityClass = "reply" | "tool" | "thinking";
+
+export interface EventApplierStats {
+  /** Tool executions started during the run. */
+  toolStarts: number;
+  /** Total thinking chars streamed (counted regardless of showThinking). */
+  thinkingChars: number;
+  /** Class of the last substantive event seen (null when none was seen). */
+  lastSubstantive: FinalActivityClass | null;
+}
+
 export interface EventApplier {
   handleEventLine(line: string): void;
   getReplyText(): string;
+  /** Activity stats used to judge whether an exit-0 run actually delivered a
+   *  final answer (#506). */
+  getStats(): EventApplierStats;
   /** omp fallback: `-p` prints the plain reply as raw stdout; append it
    *  straight through (no event parsing). */
   appendRaw(text: string): void;
@@ -494,6 +511,9 @@ export function makeEventApplier(
 ): EventApplier {
   let replyText = "";
   let msgWritten = 0;
+  let toolStarts = 0;
+  let thinkingChars = 0;
+  let lastSubstantive: FinalActivityClass | null = null;
   const lastToolText = new Map<string, string>();
   const thinking = new ThinkingCollector(opts.showThinking);
   const flushThinking = (): void => {
@@ -509,10 +529,12 @@ export function makeEventApplier(
     }
     if (ev.kind === "thinking-delta") {
       thinking.push(ev.delta);
+      thinkingChars += ev.delta.length;
       return;
     }
     if (ev.kind === "thinking-end") {
       flushThinking();
+      lastSubstantive = "thinking";
       return;
     }
     if (ev.kind === "agent-settled") {
@@ -525,6 +547,7 @@ export function makeEventApplier(
       replyText += ev.delta;
       msgWritten += ev.delta.length;
       writers.reply.write(ev.delta);
+      lastSubstantive = "reply";
       return;
     }
     if (ev.kind === "reply-complete") {
@@ -539,6 +562,7 @@ export function makeEventApplier(
       }
       msgWritten = 0;
       replyText = ev.content;
+      lastSubstantive = "reply";
       return;
     }
     if (ev.kind === "tool-update") {
@@ -547,7 +571,12 @@ export function makeEventApplier(
       const add = newPortion(ev.text, prev);
       lastToolText.set(ev.toolCallId, ev.text);
       if (add) writers.activity?.write(add.endsWith("\n") ? add : `${add}\n`);
+      lastSubstantive = "tool";
       return;
+    }
+    if (ev.kind === "tool-start") toolStarts++;
+    if (ev.kind === "tool-start" || ev.kind === "tool-end") {
+      lastSubstantive = "tool";
     }
     flushThinking();
     const lines = activityLines(ev, { showThinking: opts.showThinking });
@@ -556,9 +585,11 @@ export function makeEventApplier(
   return {
     handleEventLine,
     getReplyText: () => replyText,
+    getStats: (): EventApplierStats => ({ toolStarts, thinkingChars, lastSubstantive }),
     appendRaw(text: string) {
       replyText += text;
       writers.reply.write(text);
+      lastSubstantive = "reply";
     },
   };
 }
@@ -1386,8 +1417,27 @@ async function runDelegate(
           run.exitCode = code;
           run.exitSignal = signal ?? undefined;
           const output = applier.getReplyText().trim();
+          const stats = applier.getStats();
+          // #506: exit 0 with no delivered final answer is a silent false
+          // success — fail loudly unless the run's last substantive act was a
+          // tool execution (work persisted to disk). Cancelled runs keep their
+          // own semantics (explicit user action; early return below).
+          const silentNoOp =
+            run.status !== "cancelled" && isSilentNoOp(code, output, stats.lastSubstantive);
+          if (silentNoOp) {
+            debug.event("delegate-silent-noop", { runId, code, toolStarts: stats.toolStarts, thinkingChars: stats.thinkingChars, lastSubstantive: stats.lastSubstantive });
+            logWarn("delegate", { event: "silent-noop-failed", runId, agent: args.agent, toolStarts: stats.toolStarts, thinkingChars: stats.thinkingChars, lastSubstantive: stats.lastSubstantive });
+          }
           let body: string;
-          if (code === 0) {
+          if (silentNoOp) {
+            // Loud failure diagnostics instead of "(no output)".
+            const parts: string[] = [silentNoOpDiagnosis(stats)];
+            const err = stderrText.trim();
+            if (err) parts.push(`stderr:\n${err}`);
+            const tail = activityStream ? await readActivityTail(activityFile) : "";
+            if (tail) parts.push(`last activity (full log: \`${activityFile}\`):\n${tail}`);
+            body = parts.join("\n\n");
+          } else if (code === 0) {
             body = output || "(no output)";
           } else {
             // Failed runs: compose a diagnostic body — stderr first (the usual
@@ -1427,7 +1477,7 @@ async function runDelegate(
             }
             // EOF-watchdog finalize has no exit code; if the output was delivered,
             // treat it as a completed result (the process is killed afterwards).
-            const effectiveCode = effectiveExitCode(code, output, stderrText);
+            const effectiveCode = silentNoOp ? null : effectiveExitCode(code, output, stderrText);
             // Atomically flip status + result together: until this point the run
             // is still "running" to any observer, so a concurrent wait cannot
             // see "finished but result missing".
@@ -1759,6 +1809,33 @@ function formatSyncResult(agent: string, runId: string, task: string, r: ChildRe
  *  run counts as completed (0); otherwise it stays null = genuine failure. */
 export function effectiveExitCode(code: number | null, output: string, stderr: string): number | null {
   return code ?? (output || stderr ? 0 : null);
+}
+
+/** Exit-0 alone must not mean success (#506): a run that ended without
+ *  delivering any final answer is a silent false success — the parent treats
+ *  the missing result as done and never re-dispatches. Credible as a success
+ *  only when the LAST substantive act was a tool execution (work persisted to
+ *  disk, e.g. a worker finishing its final edit); ending on a thinking
+ *  segment, an empty text block, or having produced nothing observable means
+ *  the child stalled (often thinking-budget exhaustion) undelivered. */
+export function isSilentNoOp(
+  code: number | null,
+  output: string,
+  lastSubstantive: FinalActivityClass | null,
+): boolean {
+  return code === 0 && output === "" && lastSubstantive !== "tool";
+}
+
+/** Diagnosis body for a silent no-op failure: what the run's last observable
+ *  act was, why that is not a success, and the likely causes. */
+export function silentNoOpDiagnosis(stats: EventApplierStats): string {
+  if (stats.lastSubstantive === "thinking") {
+    return `NO final answer delivered despite exit 0: the run ended after a thinking segment (~${stats.thinkingChars.toLocaleString()} thinking chars, ${stats.toolStarts} tool call${stats.toolStarts === 1 ? "" : "s"}) without producing any reply text. Likely causes: thinking budget exhausted, an upstream error swallowed by the host, or a stalled loop.`;
+  }
+  if (stats.lastSubstantive === "reply") {
+    return "NO final answer delivered despite exit 0: the final text block was empty.";
+  }
+  return "NO final answer delivered despite exit 0: the run produced no observable output at all (no reply text, no tool calls). Likely causes: the model never produced a turn, an upstream error swallowed by the host, or a crashed loop.";
 }
 
 /** Pure read-after-finish predicate: should the completion notification be
