@@ -172,6 +172,7 @@
 | 键 | 类型 | 默认值 | 状态 | 说明 |
 |----|------|--------|------|------|
 | `compress.maxContextLimit` | number \| string | `"75%"` | 🟢 ACTIVE | 触发强制压缩 nudge 的上下文阈值。 |
+| `compress.minContextLimit` | number \| string | *(内核默认 0.45)* | 🟢 ACTIVE | nudge 活动区间的下限；软目标低于内核默认 45% 休眠线时须设为 ≤ `maxContextLimit`（#502）。 |
 | `compress.emergencyThresholdPercent` | number \| string | `"95%"` | 🟢 ACTIVE | 触发紧急截断的上下文阈值。 |
 | `compress.nudgeGrowthTokens` | number | `50000` | 🟢 ACTIVE | 软压缩 nudge 的 token 增长步长。 |
 | `compress.reasoning` | object | `{ "drop": true, "threshold": 2048 }` | 🟢 ACTIVE | 请求时丢弃历史 `compress` 调用上的超大思考（不修改持久化历史）。 |
@@ -230,7 +231,7 @@
 - **类型：** `number`
 - **默认值：** *(自动)* —— 每轮实时读取模型的 `contextWindow`
 - **状态：** 🟢 ACTIVE
-- **说明：** 覆盖上下文窗口大小（token 数）。默认每轮从活跃模型的 `ctx.model.contextWindow` 读取，切换模型时自动保持正确。在模型元数据可能不可用的测试或无头/非交互会话中，可设置显式值。环境变量 `ACP_MODEL_CONTEXT_LIMIT` 优先于此值。
+- **说明：** 覆盖上下文窗口大小（token 数）。默认每轮从活跃模型的 `ctx.model.contextWindow` 读取，切换模型时自动保持正确。在模型元数据可能不可用的测试或无头/非交互会话中，可设置显式值。环境变量 `ACP_MODEL_CONTEXT_LIMIT` 优先于此值。若希望日常上下文保持较小、同时允许单个任务突发到原始窗口，请保持此值默认，改用软档位表达 —— 见[软目标与弹性余量](#软目标与弹性余量-502)。
 
 ### `outputHeadroomMaxPct`
 
@@ -578,6 +579,13 @@
 - **状态：** 🟢 ACTIVE
 - **说明：** 触发**强制压缩** nudge 的上下文用量阈值。用量达到此水平后，每轮都会触发 nudge，绕过通常限制频率的增长门控和节奏检查。接受比例值（`0.75`）或百分比字符串（`"75%"`）。值越低，扩展压缩得越早、越激进。映射到内核设置 `nudge.maxContextLimitPct`。
 
+### `compress.minContextLimit`
+
+- **类型：** `number | string`
+- **默认值：** *(内核默认 `0.45`)* —— 未设置时保留内核下限，存量配置行为逐字节不变
+- **状态：** 🟢 ACTIVE
+- **说明：** nudge 活动区间的下限。使用率低于该值时，主动性 nudge 路径（首见 mass、tier 计数）保持休眠；高于它则正常武装。`compress.maxContextLimit` 的越档压力分支**不受**此值门控 —— 强制 nudge 在 `maxContextLimit` 处照发。当把软目标降到内核默认 0.45 以下较多时（例如把上下文钉在大原始窗口的 35% 附近），应把它设为不高于 `maxContextLimit`，否则内核每轮都会记录一条 min>max 校验警告（#502，镜像 billion-context#1122）。接受比例值（`0.35`）或百分比字符串（`"35%"`）。须满足 `minContextLimit <= maxContextLimit <= emergencyThresholdPercent`。在 `compress.providers` 三级间逐字段合并。映射到内核字段 `nudge.minContextLimitPct`。
+
 ### `compress.emergencyThresholdPercent`
 
 - **类型：** `number | string`
@@ -651,6 +659,24 @@ provider 的 key 是 **Pi provider 名**(如 `"anthropic"`、`"openai"`、`"zhip
 ```
 
 在 `anthropic` / `claude-sonnet-4-5` 下,生效阈值变为 `maxContextLimit=70%`、`nudgeGrowthTokens=30000`、`emergencyThresholdPercent=95%`(继承自全局)。
+
+### 软目标与弹性余量 (#502)
+
+自主 agent 常常同时要两件事：日常**活跃**上下文保持较小（成本/延迟），但允许单个任务在确实需要时（例如读大文件）突发远超该目标。Pi 的使用率分母默认是每轮实时读取的 `ctx.model.contextWindow`，无需覆盖 —— 直接用软档位表达：用 `maxContextLimit` 钉住目标，目标低于内核默认 45% 休眠线时再加 `minContextLimit`：
+
+```jsonc
+// 模型原始窗口 200k；日常保持 ~70k 活跃，允许突发到真实边缘
+{
+  "compress": {
+    "maxContextLimit": "35%",      // 软目标 ≈ 70k：超过后每轮强制 nudge
+    "minContextLimit": "35%"       // 与目标一致（低于内核默认 0.45 时必须设置）
+  }
+}
+```
+
+如需与模型元数据无关的确定性分母（如无头会话），可另设顶层 `modelContextLimit` 为显式 token 数；上述百分比对两者都适用。
+
+得到的行为全部是自主的：低于档位不做任何压缩；高于档位时每轮 nudge，直到上下文回落至目标之下；其间的较大读取原样保留。这些字段同样支持按 provider / 按 model（三级级联 `models > providers > global`）。
 
 ---
 

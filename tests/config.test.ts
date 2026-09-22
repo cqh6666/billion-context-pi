@@ -103,6 +103,34 @@ test("resolveConfig handles all three compress fields together", () => {
   assert.equal(cfg.nudge.growthCap, 40000);
 });
 
+test("resolveConfig maps compress.minContextLimit (number) to nudge.minContextLimitPct (#502)", () => {
+  const cfg = resolveConfig({ compress: { minContextLimit: 0.35 } }, 1_000_000);
+  assert.equal(cfg.nudge.minContextLimitPct, 0.35);
+});
+
+test("resolveConfig maps compress.minContextLimit (percent string) to nudge.minContextLimitPct (#502)", () => {
+  const cfg = resolveConfig({ compress: { minContextLimit: "35%" } }, 1_000_000);
+  assert.equal(cfg.nudge.minContextLimitPct, 0.35);
+});
+
+test("resolveConfig keeps kernel default 0.45 for nudge.minContextLimitPct when omitted (#502)", () => {
+  const cfg = resolveConfig(EMPTY, 1_000_000);
+  assert.equal(cfg.nudge.minContextLimitPct, 0.45);
+  const cfg2 = resolveConfig({ compress: { maxContextLimit: "75%" } }, 1_000_000);
+  assert.equal(cfg2.nudge.minContextLimitPct, 0.45, "maxContextLimit alone must not touch the dormancy floor");
+});
+
+test("mergeCompress: minContextLimit cascades deepest-wins per field (#502)", () => {
+  const merged = mergeCompress(
+    { minContextLimit: "40%", maxContextLimit: "70%" },
+    { minContextLimit: "35%" },
+    { maxContextLimit: "35%" },
+  );
+  assert.equal(merged.minContextLimit, "35%");
+  assert.equal(merged.maxContextLimit, "35%");
+  assert.equal(mergeCompress({ minContextLimit: "30%" }, undefined, { nudgeGrowthTokens: 90000 }).minContextLimit, "30%");
+});
+
 test("resolveDelegate: undefined delegate defaults to enabled + separate + skip", () => {
   const r = resolveDelegate({});
   assert.equal(r.enabled, true);

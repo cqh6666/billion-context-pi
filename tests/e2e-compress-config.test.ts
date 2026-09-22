@@ -149,3 +149,77 @@ test("e2e compress config: a 2w limit fires the compress nudge at 2w tokens; a 1
     });
     process.env.HOME = savedHome;
 });
+
+// Regression (#502, mirrors billion-context#1122): a soft target below the
+// kernel's 0.45 dormancy floor triggers a per-turn console.warn in
+// processTurn unless compress.minContextLimit lowers nudge.minContextLimitPct.
+function withCapturedWarnings<T>(fn: () => T): { result: T; warnings: string[] } {
+    const original = console.warn;
+    const warnings: string[] = [];
+    console.warn = (...args: unknown[]) => {
+        warnings.push(args.map(String).join(" "));
+    };
+    try {
+        return { result: fn(), warnings };
+    } finally {
+        console.warn = original;
+    }
+}
+
+const SOFT_TARGET_JSON = { compress: { maxContextLimit: "35%", minContextLimit: "35%" } };
+const MIN_MAX_WARNING = "nudge.minContextLimitPct must not exceed nudge.maxContextLimitPct";
+
+test("e2e compress config: minContextLimit silences the kernel min>max warning and the nudge still fires (#502)", async () => {
+    const savedHome = process.env.HOME;
+    await withConfigDir(SOFT_TARGET_JSON, async (cwd) => {
+        process.env.HOME = cwd;
+        const runtime = createRuntime({});
+        await runtime.reloadConfig(cwd);
+        const cfg = runtime.configFor(ctxFor("openai", "gpt-4o", 200_000));
+        assert.equal(cfg.nudge.maxContextLimitPct, 0.35, "acp.json soft target reaches the kernel");
+        assert.equal(cfg.nudge.minContextLimitPct, 0.35, "minContextLimit lowers the dormancy floor");
+
+        // 40% of 200k → over the 35% band
+        const { result: turn, warnings } = withCapturedWarnings(() =>
+            runtime.core.processTurn({
+                messages: compressibleMessages(),
+                state: createInitialState(),
+                config: cfg,
+                tokenCount: 80_000,
+            }),
+        );
+        assert.ok(turn.nudge?.shouldInject, "over-band pressure nudge fires at 40% vs the 35% soft target");
+        assert.ok(
+            warnings.every((w) => !w.includes(MIN_MAX_WARNING)),
+            `no ${MIN_MAX_WARNING} validation warning once min <= max`,
+        );
+    });
+    process.env.HOME = savedHome;
+});
+
+test("e2e compress config: without minContextLimit the kernel warns every turn, but the pressure nudge is not gated by it (#502 control)", async () => {
+    const savedHome = process.env.HOME;
+    await withConfigDir({ compress: { maxContextLimit: "35%" } }, async (cwd) => {
+        process.env.HOME = cwd;
+        const runtime = createRuntime({});
+        await runtime.reloadConfig(cwd);
+        const cfg = runtime.configFor(ctxFor("openai", "gpt-4o", 200_000));
+        assert.equal(cfg.nudge.maxContextLimitPct, 0.35);
+        assert.equal(cfg.nudge.minContextLimitPct, 0.45, "kernel default floor untouched when minContextLimit is omitted");
+
+        const { result: turn, warnings } = withCapturedWarnings(() =>
+            runtime.core.processTurn({
+                messages: compressibleMessages(),
+                state: createInitialState(),
+                config: cfg,
+                tokenCount: 80_000,
+            }),
+        );
+        assert.ok(
+            warnings.some((w) => w.includes(MIN_MAX_WARNING)),
+            "pre-fix behavior: per-turn validation warning at floor 0.45 > target 0.35",
+        );
+        assert.ok(turn.nudge?.shouldInject, "over-band pressure branch fires regardless of the dormancy floor");
+    });
+    process.env.HOME = savedHome;
+});

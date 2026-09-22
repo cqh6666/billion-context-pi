@@ -173,6 +173,7 @@ All keys below are currently **ACTIVE**.
 | Key | Type | Default | Status | Description |
 |-----|------|---------|--------|-------------|
 | `compress.maxContextLimit` | number \| string | `"75%"` | 🟢 ACTIVE | Context threshold that triggers forced compression nudges. |
+| `compress.minContextLimit` | number \| string | *(kernel default 0.45)* | 🟢 ACTIVE | Lower bound of the nudge activity band; set ≤ `maxContextLimit` whenever the soft target sits under the kernel's 45% dormancy floor (#502). |
 | `compress.emergencyThresholdPercent` | number \| string | `"95%"` | 🟢 ACTIVE | Context threshold that triggers emergency truncation. |
 | `compress.nudgeGrowthTokens` | number | `50000` | 🟢 ACTIVE | Token growth step for soft compression nudges. |
 | `compress.reasoning` | object | `{ "drop": true, "threshold": 2048 }` | 🟢 ACTIVE | Drop oversized thinking from historical `compress` calls (request-time; persisted history untouched). |
@@ -234,7 +235,7 @@ All keys below are currently **ACTIVE**.
 - **Type:** `number`
 - **Default:** *(auto)* — the model's `contextWindow` read live each turn
 - **Status:** 🟢 ACTIVE
-- **Description:** Override the context limit, in tokens. By default the limit is read from the active model's `ctx.model.contextWindow` on every turn, so it stays correct when you switch models. Set an explicit value for deterministic test runs or headless/non-interactive sessions where the model metadata may be unavailable. The `ACP_MODEL_CONTEXT_LIMIT` environment variable takes precedence over this value.
+- **Description:** Override the context limit, in tokens. By default the limit is read from the active model's `ctx.model.contextWindow` on every turn, so it stays correct when you switch models. Set an explicit value for deterministic test runs or headless/non-interactive sessions where the model metadata may be unavailable. The `ACP_MODEL_CONTEXT_LIMIT` environment variable takes precedence over this value. To pin day-to-day context to a soft target well below the native window while still letting single tasks burst up to the full window, leave this at its default and use the soft bands instead — see [Soft target with elastic headroom](#soft-target-with-elastic-headroom-502).
 
 ### `outputHeadroomMaxPct`
 
@@ -582,6 +583,13 @@ The flow is:
 - **Status:** 🟢 ACTIVE
 - **Description:** The context-usage threshold that triggers **forced compression** nudges. Once usage reaches this level, nudges fire on every turn, bypassing the growth-gate and cadence checks that normally throttle them. Accepts a ratio (`0.75`) or a percent string (`"75%"`). A lower value makes the extension compress earlier and more aggressively. Maps to the kernel setting `nudge.maxContextLimitPct`.
 
+### `compress.minContextLimit`
+
+- **Type:** `number | string`
+- **Default:** *(kernel default `0.45`)* — unset keeps the kernel floor, so existing configs behave byte-for-byte as before
+- **Status:** 🟢 ACTIVE
+- **Description:** Lower bound of the nudge activity band. Below this usage the proactive nudge paths (first-sight mass, tier counting) stay dormant; above it they arm normally. The over-band pressure branch of `compress.maxContextLimit` is **not** gated by this value — forced nudges fire at `maxContextLimit` regardless. Set it at or below `maxContextLimit` whenever you lower the soft target well under the kernel's 0.45 default (e.g. pinning context near 35% of a large native window); otherwise the kernel logs a min>max validation warning on every turn (#502, mirrors billion-context#1122). Accepts a ratio (`0.35`) or a percent string (`"35%"`). Must satisfy `minContextLimit <= maxContextLimit <= emergencyThresholdPercent`. Merged per-field across the three levels of `compress.providers`. Maps to the kernel field `nudge.minContextLimitPct`.
+
 ### `compress.emergencyThresholdPercent`
 
 - **Type:** `number | string`
@@ -655,6 +663,24 @@ The provider key is the **Pi provider name** (e.g. `"anthropic"`, `"openai"`, `"
 ```
 
 On `anthropic` / `claude-sonnet-4-5` the effective thresholds become `maxContextLimit=70%`, `nudgeGrowthTokens=30000`, and `emergencyThresholdPercent=95%` (inherited from global).
+
+### Soft target with elastic headroom (#502)
+
+Autonomous agents often want two things at once: keep the *active* context small (cost/latency), but allow a single task to burst well past that target when it genuinely needs to (e.g. reading a large file). In Pi the usage denominator defaults to the live `ctx.model.contextWindow`, so no override is needed — express the target with the soft bands instead: pin it with `maxContextLimit`, and add `minContextLimit` whenever the target sits under the kernel's 45% dormancy floor:
+
+```jsonc
+// model with a 200k native window; keep ~70k active, allow bursts up to the real edge
+{
+  "compress": {
+    "maxContextLimit": "35%",      // soft target ≈ 70k: forced nudge every turn above this
+    "minContextLimit": "35%"       // match the target (required once under the 0.45 kernel default)
+  }
+}
+```
+
+Optionally set the top-level `modelContextLimit` to an explicit token count if you want a deterministic denominator independent of model metadata (e.g. headless sessions); the percentages above resolve against it either way.
+
+Resulting behavior, all autonomous: below the band nothing is compressed; above it the extension nudges every turn until context drops back under the target; a large read in between rides along intact. The same fields work per-provider / per-model through the three-level cascade (`models > providers > global`).
 
 ---
 
