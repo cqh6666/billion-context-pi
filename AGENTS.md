@@ -75,6 +75,8 @@ violated this contract and was reverted (acp-kernel#191). **Pin discipline:**
 before bumping `acp-kernel`, verify the target release preserves id/ref
 immutability — never pin a version that recycles ref numbers or raw ids.
 
+7. **Nudge cadence is flat 50K by design (kernel contract)** — acp-kernel pins the growth interval at 50000 for every window size (`nudge.growthFloor == nudge.growthCap == 50000`; window-percentage scaling deliberately removed — kernel #379/#380 settled "growth-driven, no usage/count proxy gates"). Do NOT re-scale it with the context window or re-add percentage gates. Users wanting a lazier cadence configure `growthFloor`/`growthCap` (bili surface: `nudgeGrowthTokens`) explicitly.
+
 ## 3. Development Standards
 
 ### Build Commands
