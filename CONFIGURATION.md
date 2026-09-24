@@ -133,6 +133,7 @@ All keys below are currently **ACTIVE**.
 | `repetitionGuard` | boolean \| object | `true` | 🟢 ACTIVE | Break infinite loops of byte-identical tool calls (warn at 3 consecutive, block + abort at 5). |
 | `degenerationGuard` | boolean \| object | `true` | 🟢 ACTIVE | Collapse degenerate single-codepoint runs (e.g. 4655×「【」) in assistant text/thinking of the outgoing view and inject a one-shot recovery notice — breaks the abort loop where pi replays degenerated thinking back to the provider on every request (#351). |
 | `hostSession` | boolean \| object | `false` | 🟢 ACTIVE | Turn-boundary policy for multi-session hosts: count injected `custom_message` entries as turn starts. Off by default (pi-native behavior). |
+| `priceProfile` | object | *(unset)* | 🟢 ACTIVE | Price profile `{ w?, r?, q? }` (normalized over the input-token unit, p_in = 1) for the `acp_cache` report's per-fold P&L verdicts. Each unset field falls back to the built-in Anthropic-ratio approximation (`w: 1, r: 0.1, q: 4`); absent key = byte-identical reports. Report-only. |
 
 **Delegate keys**
 
@@ -275,6 +276,29 @@ All keys below are currently **ACTIVE**.
 - **Default:** `none` (empty)
 - **Status:** 🟢 ACTIVE
 - **Description:** Tool-name patterns (glob suffix allowed) whose **latest** call+result pair is hard-excluded from compression (matching refs render as `BLOCKED`); older pairs remain compressible. Intended for cumulative-snapshot tools where each call supersedes the last. Same validation rules as `protectedTools`. See the ⚠ note under `protectedTools` for when to use which knob.
+
+### `priceProfile`
+
+- **Type:** `object` (`{ w?, r?, q? }`, all non-negative numbers)
+- **Default:** *(unset — each unset field falls back to `w: 1`, `r: 0.1`, `q: 4`, the built-in Anthropic-ratio approximation; reports are byte-identical when the key is absent)*
+- **Status:** 🟢 ACTIVE
+- **Description:** Price profile for the **fold-economics verdicts** in the `acp_cache` report (`acp_cache` tool / `/acp-cache` command). The per-fold P&L fields (`oneTimeCostUnits`, `perTurnSavingUnits`, `breakevenTurns`, `paidBack`) are expressed in input-token-equivalent units using **normalized multipliers over the input-token unit (p_in = 1)**:
+  - `w` = cacheWrite price ÷ input price (write-through surcharge; `1` when the provider bills cache writes at the normal input rate)
+  - `r` = cacheRead price ÷ input price (cached-input discount factor)
+  - `q` = output price ÷ input price
+  The same fold therefore shows a different breakeven point and PAID BACK verdict under different providers' economics — e.g. under the default profile a DeepSeek-class upstream (low output multiple) looks like it pays back ~2.7× slower than it really does. Set it when your upstream is not Anthropic-ratio priced; measured per-model values are tabulated in [docs/compression-economics.md §7.2](docs/compression-economics.md). Each unset field falls back to the kernel default (`w=1`, `r=0.1`, `q=4`); a fully absent key leaves the report byte-identical. Validation: each present field must be a finite number ≥ 0; unknown subkeys are ignored; a malformed value rejects the whole block with a loud warning (the report then uses the defaults) — never fails the session. **Report-only**: the profile never affects compression triggers, cadence, or any wire behavior. Project-local `acp.json` overrides the global one (whole-key replacement). Examples:
+
+  ```jsonc
+  // Anthropic ≈ default: cheap cached reads (~0.1×), ~4× output multiple → omit the key
+  // DeepSeek-V3 ≈ low output multiple — the default overstates its breakeven ~2.7×
+  { "priceProfile": { "w": 1, "r": 0.1, "q": 1.5 } }
+  // OpenAI GPT-4o/o-series: 50% cached-read discount, flat writes, 4× output
+  { "priceProfile": { "w": 1, "r": 0.5, "q": 4 } }
+  // Self-hosted / free tier: everything costs zero tokens of your budget
+  { "priceProfile": { "w": 0, "r": 0, "q": 0 } }
+  ```
+
+  Use list prices relative to the same model's normal input price; relays with custom markup should use their effective rates.
 
 ---
 

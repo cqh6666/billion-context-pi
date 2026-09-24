@@ -132,6 +132,7 @@
 | `repetitionGuard` | boolean \| object | `true` | 🟢 ACTIVE | 打断字节级完全相同的工具调用死循环（连续 3 次告警，连续 5 次拦截并中止本轮）。 |
 | `degenerationGuard` | boolean \| object | `true` | 🟢 ACTIVE | 折叠出站视图中 assistant text/thinking 里的单字符退化连击（如 4655×「【」）并注入一次性恢复通知——打破 pi 每轮请求都回传退化 thinking 导致的连环 abort 死循环（#351）。 |
 | `hostSession` | boolean \| object | `false` | 🟢 ACTIVE | 多会话宿主的回合边界策略：是否把注入的 `custom_message` 计为回合起点。默认关闭（pi 原生行为）。 |
+| `priceProfile` | object | *（未设置）* | 🟢 ACTIVE | 价格档 `{ w?, r?, q? }`（以输入 token 单价为基准归一化，p_in = 1），用于 `acp_cache` 报告里每个折叠的损益判定。每个未设置字段回落到内置 Anthropic 比例近似（`w: 1, r: 0.1, q: 4`）；整键缺省时报告逐字节不变。仅影响报告。 |
 
 **delegate 键**
 
@@ -271,6 +272,29 @@
 - **默认值：** `无`（空）
 - **状态：** 🟢 ACTIVE
 - **说明：** 工具名模式（支持 glob 后缀）——仅匹配的**最近一次** call+result 对被硬排除在压缩之外（ref 渲染为 `BLOCKED`），更早的对仍可压缩。适用于每次调用取代上一次的累积快照型工具。校验规则与 `protectedTools` 相同。何时用哪个旋钮见 `protectedTools` 下的 ⚠ 说明。
+
+### `priceProfile`
+
+- **类型：** `object`（`{ w?, r?, q? }`，均为非负数）
+- **默认值：** *（未设置——每个未设置字段回落到 `w: 1`、`r: 0.1`、`q: 4`，即内置的 Anthropic 比例近似；整键缺省时报告输出与现状逐字节一致）*
+- **状态：** 🟢 ACTIVE
+- **说明：** `acp_cache` 报告（`acp_cache` 工具 / `/acp-cache` 命令）中**折叠损益判定**的价格档。每个折叠的 P&L 字段（`oneTimeCostUnits`、`perTurnSavingUnits`、`breakevenTurns`、`paidBack`）以**输入 token 当量**计价，采用**以输入 token 单价为基准（p_in = 1）的归一化倍数**：
+  - `w` = 缓存写入价 ÷ 输入价（写穿透附加费；按普通输入价计费缓存写入时为 `1`）
+  - `r` = 缓存读取价 ÷ 输入价（缓存命中折扣系数）
+  - `q` = 输出价 ÷ 输入价
+  同一折叠在不同供应商的经济结构下会算出不同的回本点与 PAID BACK 判定——例如 DeepSeek 类上游（输出倍数低）在默认档下回本点被高估约 2.7×。上游非 Anthropic 比例计价时请显式配置；各模型的实测取值见 [docs/compression-economics.md §7.2](docs/compression-economics.md)。每个未设置字段回落到内核默认值（`w=1`、`r=0.1`、`q=4`）；整键缺省时报告逐字节不变。校验：每个出现的字段必须是有限数且 ≥ 0；未知子键忽略；非法值拒绝整个块并大声告警（报告回落默认档）——绝不导致会话失败。**仅影响报告**：价格档不影响任何压缩触发、节奏或 wire 行为。项目级 `acp.json` 覆盖全局（整键替换）。示例：
+
+  ```jsonc
+  // Anthropic ≈ 默认：缓存读取便宜（~0.1×）、输出约 4× → 直接省略该键
+  // DeepSeek-V3 ≈ 输出倍数低——默认档会把它的回本点高估约 2.7×
+  { "priceProfile": { "w": 1, "r": 0.1, "q": 1.5 } }
+  // OpenAI GPT-4o/o 系列：缓存读取 5 折、写入平价、输出 4×
+  { "priceProfile": { "w": 1, "r": 0.5, "q": 4 } }
+  // 自托管 / 免费额度：一切不花你预算里的 token
+  { "priceProfile": { "w": 0, "r": 0, "q": 0 } }
+  ```
+
+  请取同一模型正常输入价的相对标价；带自定义加成的中转站请按实际生效费率填写。
 
 ---
 
