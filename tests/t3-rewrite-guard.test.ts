@@ -106,8 +106,14 @@ test("tier-3-only rewrite is rejected and state is rolled back (dog/billion-cont
 });
 
 test("tier-3 rewrite rejection names the tier-ready alternative (#344)", async () => {
+  // Default triggers are count-off (kernel #379: tier2Trigger 1000), so this
+  // test pins the #344 hint MECHANISM with explicit low triggers — 5 tier-1
+  // blocks >= 3 still name the tier-2 alternative in the rejection.
   const stateFile = "/tmp/pai-acp-t3-hint.session.json";
-  const { run } = await setup(stateFile, { preserveRecentMessages: 0 });
+  const { run } = await setup(stateFile, {
+    preserveRecentMessages: 0,
+    coreOverrides: { tiers: { enabled: true, tier2Trigger: 3, tier3Trigger: 6 } },
+  });
   const sum = (t: string) => t + " " + ZH.repeat(80);
 
   for (let i = 0; i < 6; i++) {
