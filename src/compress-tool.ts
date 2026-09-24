@@ -408,7 +408,7 @@ function tier3OnlyRewrite(newBlocks: CompressionBlock[], allBlocks: CompressionB
 // message-type ranges. When the session's actionable mass is tier blocks, name
 // them so repetition-prone models get a concrete next action instead of
 // hunting (and re-hitting the guard).
-function tierReadyHint(state: CompressionState, config: ReturnType<AcpRuntime["configFor"]>): string {
+export function tierReadyHint(state: CompressionState, config: ReturnType<AcpRuntime["configFor"]>): string {
   if (!config.tiers.enabled) return "";
   const active = state.blocks.filter((b) => b.active);
   const first = (bs: CompressionBlock[]) => bs[0]?.blockId ?? "";

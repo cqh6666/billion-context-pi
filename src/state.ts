@@ -234,6 +234,13 @@ export function deriveChildState(parent: CompressionState): CompressionState {
     absorbed: [],
     rules: structuredClone(parent.rules ?? []),
     nextRuleId: parent.nextRuleId ?? fresh.nextRuleId,
+    // Ref space is NOT re-issued on derive (byRaw/byRef carry verbatim), so the
+    // image ledgers stay valid for inherited content: imageShrinks gates
+    // image_full for inherited shrunk refs, imageFullRestored keeps
+    // parent-restored refs at full resolution. The kernel's MUST-clear
+    // (resetImageFullState) applies only to ref-reissue resets.
+    imageFullRestored: structuredClone(parent.imageFullRestored ?? []),
+    imageShrinks: structuredClone(parent.imageShrinks ?? []),
     nextBlockId: parent.nextBlockId,
     nextRunId: parent.nextRunId,
   };
