@@ -27,15 +27,22 @@ export const ACP_STATUS_CUSTOM_TYPE = "acp-status";
  *  persistent in the session but never projected into LLM context (#255). */
 export const ACP_EXPORT_CUSTOM_TYPE = "acp-export";
 
+/** /acp-rule outputs (src/commands.ts) — UI-only transcript output, same
+ *  exclusion as acp-status/acp-export (#526): the rules themselves already
+ *  reach the model through the feature's own channel, so the human-facing
+ *  report must never be re-billed as model context. */
+export const ACP_RULE_CUSTOM_TYPE = "acp-rule";
+
 /** Custom-message types excluded from LLM-context projection (#255, #380):
  *  UI-only panels/docs that persist in the session but must not reach the model.
  *  Shared by isCustomMessageEntry below and the turn-boundary predicate in
  *  src/turn-boundary.ts so both views can never drift apart. */
-const CONTEXT_EXCLUDED_CUSTOM_TYPES = new Set<string>([ACP_STATUS_CUSTOM_TYPE, ACP_EXPORT_CUSTOM_TYPE]);
+const CONTEXT_EXCLUDED_CUSTOM_TYPES = new Set<string>([ACP_STATUS_CUSTOM_TYPE, ACP_EXPORT_CUSTOM_TYPE, ACP_RULE_CUSTOM_TYPE]);
 
 /** True for host-injected custom_message entries that participate in LLM
  *  context: non-empty custom_message except the UI-only types in
- *  CONTEXT_EXCLUDED_CUSTOM_TYPES (acp-status panels, acp-export docs)
+ *  CONTEXT_EXCLUDED_CUSTOM_TYPES (acp-status panels, acp-export docs,
+ *  acp-rule reports)
  *  (Pi-native projection semantics, session-manager.d.ts). The non-empty gate
  *  uses the exact same extractText check as the projection below, so an entry
  *  either enters context or it doesn't — and only entries that enter context

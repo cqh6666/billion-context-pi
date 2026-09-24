@@ -1,9 +1,9 @@
 import type { ExtensionAPI, ExtensionCommandContext, RegisteredCommand, SessionEntry } from "@earendil-works/pi-coding-agent";
 import * as path from "node:path";
 import type { AcpRuntime } from "./runtime.js";
-import { ACP_STATUS_CUSTOM_TYPE, ACP_EXPORT_CUSTOM_TYPE } from "./messages.js";
+import { ACP_STATUS_CUSTOM_TYPE, ACP_EXPORT_CUSTOM_TYPE, ACP_RULE_CUSTOM_TYPE } from "./messages.js";
 import { exportSession, parseExportArgs } from "./export.js";
-import { defaultCountTokens, parseBlockIdArg, collectBlockContent } from "acp-kernel";
+import { defaultCountTokens, parseBlockIdArg, collectBlockContent, listRules, addRule, formatRulesList, resolveRuleLimits } from "acp-kernel";
 import { getSystemPromptText } from "./compat.js";
 import { collectCoveredMessageIds, estimateTokens, collectImageTokens, modelSupportsImages, adjustedTokenCount } from "./tokens.js";
 import { usageAnchorPredatesCompression } from "./floor-stale.js";
@@ -77,6 +77,48 @@ export function makeCommands(runtime: AcpRuntime, pi?: ExtensionAPI): Array<{ na
           }
           if (typeof pi?.sendMessage === "function") {
             pi.sendMessage({ customType: ACP_STATUS_CUSTOM_TYPE, content: text, display: true });
+            return;
+          }
+          ctx.ui.notify(text);
+        },
+      },
+    },
+    {
+      name: "acp-rule",
+      options: {
+        description:
+          "List persistent rules recorded in this session, or record one directly (same rules the acp_rule feature keeps). " +
+          "Usage: /acp-rule [text to record]",
+        handler: async (args, ctx) => {
+          if (runtime.adapter.rules !== true) {
+            ctx.ui.notify(
+              'Rules are not enabled — set "rules": true in acp.json (~/.pi/acp.json or project .pi/acp.json) to turn on persistent rules.',
+              "warning",
+            );
+            return;
+          }
+          const ruleText = (args ?? "").trim();
+          let text: string;
+          try {
+            const { state } = await runtime.stateFor(ctx);
+            if (ruleText === "") {
+              const rules = listRules(state);
+              text = rules.length === 0 ? "No rules recorded." : formatRulesList(rules);
+            } else {
+              const result = addRule(state, ruleText, resolveRuleLimits(runtime.configFor(ctx)));
+              if (!result.ok) {
+                ctx.ui.notify(result.error, "error");
+                return;
+              }
+              await runtime.save(state, ctx);
+              text = `Recorded ${result.rule.id}: ${result.rule.text}`;
+            }
+          } catch (e) {
+            ctx.ui.notify(e instanceof Error ? e.message : String(e), "error");
+            return;
+          }
+          if (typeof pi?.sendMessage === "function") {
+            pi.sendMessage({ customType: ACP_RULE_CUSTOM_TYPE, content: text, display: true });
             return;
           }
           ctx.ui.notify(text);

@@ -36,6 +36,7 @@ export interface UserAcpConfig {
   toolPrompts?: ToolPromptsConfig;
   delegatePrompt?: string | null;
   hostSession?: boolean | HostSessionConfig;
+  rules?: boolean;
 }
 
 /** Read global + project acp.json, project overrides global. Returns {} on any
@@ -142,7 +143,7 @@ const KNOWN = new Set([
   "repetitionGuard", "degenerationGuard",
   "prompts", "acknowledgePromptsRisk",
   "promptSections", "nudgeSections", "toolPrompts", "delegatePrompt",
-  "hostSession",
+  "hostSession", "rules",
 ]);
 
 function pickKnown(parsed: Record<string, unknown>): UserAcpConfig {

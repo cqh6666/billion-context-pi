@@ -315,6 +315,12 @@ export interface AdapterConfig {
    *  multi-session hosts (Prime RLM & co.) whose injected agent messages must
    *  delimit real turns. See docs/host-adapter.md. */
   hostSession?: boolean | HostSessionConfig;
+  /** Persistent-rules feature gate (#526): opt-in `rules: true` in acp.json.
+   *  Gates the human `/acp-rule` command (list + record — kernel
+   *  `listRules`/`addRule` against the session `.acp.json` sidecar state) and
+   *  the model-side `acp_rule` tool (#490). Custom limits via
+   *  coreOverrides.rules ({ maxRules?, maxRuleChars? }). */
+  rules?: boolean;
   /** Legacy flat alias for `delegate.displayUsage`. Kept for backward
    *  compatibility with existing acp.json files. Prefer `delegate.displayUsage`. */
   displayUsage?: "merged" | "separate";
