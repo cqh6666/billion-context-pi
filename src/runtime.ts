@@ -160,8 +160,8 @@ export interface AcpRuntime {
    *  in this session (issue #250 loop breaker). */
   noteDeadCompress(sid: string, fingerprint: string): number;
   /** Drop a session's dead-range repeat tracking (a successful compress
-   *  renumbers refs so old fingerprints are meaningless; session_shutdown for
-   *  memory hygiene). */
+   *  advances session state, so prior failure counts no longer describe the
+   *  current ranges; session_shutdown for memory hygiene). */
   clearDeadCompress(sid: string): void;
   /** Record one turn's FRESH-anchor provider usage sample and report whether
    *  the recent window is stable enough to calibrate the internal estimate
