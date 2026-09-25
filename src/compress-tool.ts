@@ -319,6 +319,15 @@ export function blockSpanLabel(block: CompressionBlock, state: CompressionState)
   return `${block.blockId}${tierMark}=${span}${star}`;
 }
 
+// #535 P1: one-line integrity fingerprint per new/updated block — cheap
+// head/tail excerpt + char length so the model can verify its summary was
+// stored intact without decompressing.
+export function summaryFingerprintLine(blockId: string, summary: string): string {
+  const head = summary.slice(0, 30).replace(/\r?\n/g, " ");
+  const tail = summary.slice(-100).replace(/\r?\n/g, " ");
+  return ` · ${blockId} summary ${summary.length}ch · head "${head}" … tail "${tail}"`;
+}
+
 function blockHasVisibleAnchor(block: CompressionBlock, visibleIds: Set<string>): boolean {
   if (visibleIds.has(`acp_summary_${block.blockId}`)) return true;
   return block.effectiveMessageIds.some((id) => visibleIds.has(id));
@@ -602,6 +611,9 @@ async function handleCompress(args: CompressArgs, runtime: AcpRuntime, ctx: Exte
     ? `blocks: ${newBlocks.map((b) => blockSpanLabel(b, applied.state)).join(", ")}`
     : "0 blocks";
   const lines = [`▣ ACP | ${formatK(beforeTokens)} → ${formatK(afterTokens)} tokens (~${formatK(reclaimed)} reclaimed, ${spanClause})`];
+  if (blocksCreated > 0) {
+    for (const b of newBlocks) lines.push(summaryFingerprintLine(b.blockId, b.summary));
+  }
   if (warnings.length > 0) lines.push("⚠️ " + warnings.join("; "));
   if (errors.length > 0) lines.push("Errors: " + errors.join("; "));
   // #420: carry the post-compression snapshot so a same-turn follow-up
